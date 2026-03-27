@@ -2,7 +2,7 @@
 // @id              explorer-auto-refresh
 // @name            Explorer Auto Refresh
 // @description     Automatically refreshes Explorer folder views when files change, restoring classic Windows behavior
-// @version         1.0
+// @version         1.1
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -613,8 +613,6 @@ void FileWatcherThread() {
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Explorer Auto Refresh: Initializing...");
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
     LoadSettings();
     Wh_Log(L"Settings: enabled=%d debounce=%ums network=%d",
            g_enabled.load(), g_debounceMs.load(), g_watchNetworkDrives.load());
@@ -661,7 +659,6 @@ void Wh_ModBeforeUninit() {
 
 void Wh_ModUninit() {
     Wh_Log(L"Explorer Auto Refresh: Unloaded");
-    CoUninitialize();
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
