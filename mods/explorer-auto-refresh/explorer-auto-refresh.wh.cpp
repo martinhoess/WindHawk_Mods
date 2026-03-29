@@ -2,7 +2,7 @@
 // @id              explorer-auto-refresh
 // @name            Explorer Auto Refresh
 // @description     Automatically refreshes Explorer folder views when files change, restoring classic Windows behavior
-// @version         1.1
+// @version         1.2
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -413,6 +413,7 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 }
 
 void EventMonitorThread() {
+  try {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     RefreshWindowSinks();
@@ -470,6 +471,9 @@ void EventMonitorThread() {
     g_windowPaths.clear();
 
     CoUninitialize();
+  } catch (...) {
+    Wh_Log(L"EventMonitorThread: unhandled exception");
+  }
 }
 
 // ============================================================================
@@ -477,6 +481,7 @@ void EventMonitorThread() {
 // ============================================================================
 
 void FileWatcherThread() {
+  try {
     HANDLE watcherHandles[MAX_WATCHED_DIRS + 1];
     std::wstring dirKeys[MAX_WATCHED_DIRS];
     int handleCount = 0;
@@ -605,6 +610,9 @@ void FileWatcherThread() {
         }
         g_watchedDirs.clear();
     }
+  } catch (...) {
+    Wh_Log(L"FileWatcherThread: unhandled exception");
+  }
 }
 
 // ============================================================================
