@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
-// @version         1.0
+// @version         1.1
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -2638,13 +2638,13 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
         bool isUp   = (wp == WM_KEYUP   || wp == WM_SYSKEYUP);
 
         if (isDown) {
-            if (k->vkCode == VK_LWIN  || k->vkCode == VK_RWIN)
-                g_winDown  = true;
-            else if (k->vkCode == VK_LCONTROL || k->vkCode == VK_RCONTROL)
-                g_ctrlDown = true;
-            else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU)
-                g_altDown  = true;
-            else if (k->vkCode == VK_OEM_PERIOD) {
+            if (k->vkCode == VK_LWIN  || k->vkCode == VK_RWIN) {
+                if (!(k->flags & LLKHF_INJECTED)) g_winDown  = true;
+            } else if (k->vkCode == VK_LCONTROL || k->vkCode == VK_RCONTROL) {
+                if (!(k->flags & LLKHF_INJECTED)) g_ctrlDown = true;
+            } else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU) {
+                if (!(k->flags & LLKHF_INJECTED)) g_altDown  = true;
+            } else if (k->vkCode == VK_OEM_PERIOD) {
                 bool customShortcut =
                     (g_altShortcut == AltShortcut::CtrlPeriod && g_ctrlDown) ||
                     (g_altShortcut == AltShortcut::AltPeriod  && g_altDown);
@@ -2657,10 +2657,12 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                         if (g_hwnd) PostMessage(g_hwnd, WM_SHOW_PICKER, 0, 0);
                     }
                     return 1;  // block the key
-                } else if (g_winDown && g_blockWinDot) {
+                } else if ((g_winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)) && g_blockWinDot) {
                     // Win+. — open picker and suppress the period so the system
-                    // emoji dialog never sees it. Do NOT block Win keyup — that
-                    // would leave the Win key "stuck" in the system's key state.
+                    // emoji dialog never sees it.
+                    // GetAsyncKeyState is used as a fallback in case g_winDown
+                    // fell out of sync (e.g. key pressed before hook was active
+                    // or cleared by an injected Win-up from another app).
                     if (g_hwnd && IsWindowVisible(g_hwnd))
                         PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
                     else {
@@ -2668,6 +2670,15 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                         AllowSetForegroundWindow(GetCurrentProcessId());
                         if (g_hwnd) PostMessage(g_hwnd, WM_SHOW_PICKER, 0, 0);
                     }
+                    // Inject a neutral VK_F23 down+up so Windows sees that Win
+                    // was pressed in combination with another key.  Without this,
+                    // the system observes Win↓ … Win↑ with no other key in
+                    // between and opens the Start menu after our picker appears.
+                    INPUT inp[2] = {};
+                    inp[0].type = INPUT_KEYBOARD; inp[0].ki.wVk = VK_F23;
+                    inp[1].type = INPUT_KEYBOARD; inp[1].ki.wVk = VK_F23;
+                    inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    SendInput(2, inp, sizeof(INPUT));
                     g_suppressPeriodUp = true;
                     return 1;  // block period keydown
                 }
@@ -2683,13 +2694,13 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                 return 1;  // block Ctrl+Space
             }
         } else if (isUp) {
-            if (k->vkCode == VK_LWIN  || k->vkCode == VK_RWIN)
-                g_winDown  = false;
-            else if (k->vkCode == VK_LCONTROL || k->vkCode == VK_RCONTROL)
-                g_ctrlDown = false;
-            else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU)
-                g_altDown  = false;
-            else if (k->vkCode == VK_OEM_PERIOD && g_suppressPeriodUp) {
+            if (k->vkCode == VK_LWIN  || k->vkCode == VK_RWIN) {
+                if (!(k->flags & LLKHF_INJECTED)) g_winDown  = false;
+            } else if (k->vkCode == VK_LCONTROL || k->vkCode == VK_RCONTROL) {
+                if (!(k->flags & LLKHF_INJECTED)) g_ctrlDown = false;
+            } else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU) {
+                if (!(k->flags & LLKHF_INJECTED)) g_altDown  = false;
+            } else if (k->vkCode == VK_OEM_PERIOD && g_suppressPeriodUp) {
                 g_suppressPeriodUp = false;
                 return 1;  // block period keyup
             }
@@ -2703,6 +2714,9 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
 // ============================================================
 
 static DWORD WINAPI EmojiThread(LPVOID) {
+    // Elevate priority so the WH_KEYBOARD_LL hook callback is dispatched
+    // quickly and doesn't time out, which would let Win+. slip through.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     // D2D / DWrite factories
