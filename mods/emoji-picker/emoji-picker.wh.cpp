@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
-// @version         1.1
+// @version         1.2
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -2358,6 +2358,11 @@ static void ShowPickerAt() {
         };
         rel(VK_LCONTROL); rel(VK_RCONTROL);
         rel(VK_LMENU);    rel(VK_RMENU);
+        // Sync tracking flags — the injected key-ups above are tagged
+        // LLKHF_INJECTED so the hook deliberately ignores them, but
+        // the modifiers are now released from the OS's perspective.
+        g_ctrlDown = false;
+        g_altDown  = false;
     }
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, physW, physH, SWP_SHOWWINDOW);
     SetForegroundWindow(g_hwnd);
@@ -2645,6 +2650,17 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
             } else if (k->vkCode == VK_LMENU || k->vkCode == VK_RMENU) {
                 if (!(k->flags & LLKHF_INJECTED)) g_altDown  = true;
             } else if (k->vkCode == VK_OEM_PERIOD) {
+                // Self-heal modifier tracking: if our flag says a key is
+                // held but the hardware disagrees, clear the stale flag.
+                // Prevents phantom shortcut triggers after missed key-ups
+                // (e.g. hook timeout, UAC prompt, desktop switch).
+                if (g_ctrlDown && !((GetAsyncKeyState(VK_LCONTROL) | GetAsyncKeyState(VK_RCONTROL)) & 0x8000))
+                    g_ctrlDown = false;
+                if (g_altDown && !((GetAsyncKeyState(VK_LMENU) | GetAsyncKeyState(VK_RMENU)) & 0x8000))
+                    g_altDown = false;
+                if (g_winDown && !((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000))
+                    g_winDown = false;
+
                 bool customShortcut =
                     (g_altShortcut == AltShortcut::CtrlPeriod && g_ctrlDown) ||
                     (g_altShortcut == AltShortcut::AltPeriod  && g_altDown);
@@ -2683,7 +2699,8 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     return 1;  // block period keydown
                 }
             } else if (k->vkCode == VK_SPACE &&
-                       g_altShortcut == AltShortcut::CtrlSpace && g_ctrlDown) {
+                       g_altShortcut == AltShortcut::CtrlSpace && g_ctrlDown &&
+                       ((GetAsyncKeyState(VK_LCONTROL) | GetAsyncKeyState(VK_RCONTROL)) & 0x8000)) {
                 if (g_hwnd && IsWindowVisible(g_hwnd))
                     PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
                 else {
