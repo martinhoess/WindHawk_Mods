@@ -2,7 +2,7 @@
 // @id              explorer-auto-refresh
 // @name            Explorer Auto Refresh
 // @description     Automatically refreshes Explorer folder views when files change, restoring classic Windows behavior
-// @version         1.2
+// @version         1.3
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -115,6 +115,7 @@ struct DirectoryWatcher {
     HANDLE changeHandle = nullptr;
     DWORD lastRefreshTime = 0;
     DWORD watchStartTime  = 0;       // when the handle was opened (grace period clock)
+    bool  watchFailed     = false;   // true after FindFirstChangeNotification failed — don't retry
     std::vector<WindowKey> windows;  // Explorer windows currently showing this directory
 };
 
@@ -513,10 +514,19 @@ void FileWatcherThread() {
 
             // Open notification handles for newly tracked directories.
             for (auto& [normPath, watcher] : g_watchedDirs) {
-                if (watcher.changeHandle || watcher.windows.empty())
+                if (watcher.changeHandle || watcher.watchFailed || watcher.windows.empty())
                     continue;
 
                 if (!g_watchNetworkDrives && IsNetworkPath(watcher.path)) {
+                    continue;
+                }
+
+                // Only watch actual directories — Explorer shows zip files as
+                // folders but FindFirstChangeNotificationW can't watch them.
+                DWORD attrs = GetFileAttributesW(watcher.path.c_str());
+                if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    Wh_Log(L"Skipping non-directory: %s", watcher.path.c_str());
+                    watcher.watchFailed = true;
                     continue;
                 }
 
@@ -536,6 +546,7 @@ void FileWatcherThread() {
                     Wh_Log(L"Started watching: %s", watcher.path.c_str());
                 } else {
                     Wh_Log(L"Failed to watch: %s (err %u)", watcher.path.c_str(), GetLastError());
+                    watcher.watchFailed = true;
                 }
             }
 
