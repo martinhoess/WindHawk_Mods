@@ -1952,7 +1952,7 @@ static void UpdateFilter() {
 
 // Forward declaration (SelectEmoji defined later)
 static void SelectEmoji(int filteredIdx);
-static void SelectEmojiCh(const std::wstring& ch);
+static void SelectEmojiCh(std::wstring ch);
 
 // ============================================================
 // Edit control subclass — intercept Escape / Enter / arrow keys
@@ -2307,10 +2307,13 @@ static void SelectEmoji(int filteredIdx) {
     PostMessage(g_hwnd, WM_INSERT_EMOJI, 0, 0);
 }
 
-static void SelectEmojiCh(const std::wstring& ch) {
-    std::wstring copy = ch;   // capture before AddToRecent shifts g_recent elements
-    AddToRecent(copy.c_str());
-    g_pending   = copy;
+// ch is taken by value: callers pass `g_recent[i]` and AddToRecent() below
+// mutates g_recent, invalidating any reference into it. The by-value copy
+// happens at the call site before AddToRecent runs, so the contract is
+// safe regardless of what the function body does.
+static void SelectEmojiCh(std::wstring ch) {
+    AddToRecent(ch.c_str());
+    g_pending   = ch;
     g_inserting = true;
     ShowWindow(g_hwnd, SW_HIDE);
     if (!RestorePrevFocus()) {
