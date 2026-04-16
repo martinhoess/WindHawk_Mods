@@ -1793,6 +1793,15 @@ static HWND   g_prevFocus  = nullptr;
 static bool   g_inserting  = false;
 enum class AltShortcut { CtrlPeriod, CtrlSpace, AltPeriod, Disabled };
 
+// Trigger data captured by the hook proc and handed to the UI thread via
+// PostMessage(WM_SHOW_PICKER). Using a heap-allocated struct rather than
+// globals avoids a race where rapid double-triggers overwrite each other's
+// capture before the first WM_SHOW_PICKER is processed.
+struct PickerTrigger {
+    HWND  prevFocus;
+    POINT anchorPt;
+};
+
 static UINT   g_dpi              = 96;
 // These flags are read by KbHookProc on whatever thread the OS dispatches the
 // low-level hook on, and written by ReadSettings / ShowPickerAt / the hook
@@ -2290,7 +2299,22 @@ static void SelectEmojiCh(const std::wstring& ch) {
 // Show / position picker
 // ============================================================
 
-static void ShowPickerAt() {
+// trigger may be null (e.g. refresh-after-settings-change path). When non-null
+// it supplies this invocation's captured foreground window + anchor point,
+// avoiding races between back-to-back triggers.
+static void ShowPickerAt(PickerTrigger* trigger) {
+    // Adopt the trigger's captured state into the module globals the rest of
+    // the UI thread code reads. (Other UI-thread consumers — SelectEmoji,
+    // click handlers — still want g_prevFocus as a global.)
+    if (trigger) {
+        g_prevFocus = trigger->prevFocus;
+        g_anchorPt  = trigger->anchorPt;
+    }
+    // If the captured foreground is our own picker (rare — e.g. second Win+.
+    // while the picker is about to become visible), don't try to restore focus
+    // back to ourselves after insertion.
+    if (g_prevFocus == g_hwnd) g_prevFocus = nullptr;
+
     g_theme = IsDarkMode() ? &DARK : &LIGHT;
 
     // Recreate edit brush for new theme
@@ -2500,9 +2524,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PostQuitMessage(0);
         return 0;
 
-    case WM_SHOW_PICKER:
-        ShowPickerAt();
+    case WM_SHOW_PICKER: {
+        auto* trig = reinterpret_cast<PickerTrigger*>(lp);
+        ShowPickerAt(trig);
+        delete trig;
         return 0;
+    }
 
     case WM_INSERT_EMOJI:
         DoInsert();
@@ -2643,24 +2670,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Keyboard hook
 // ============================================================
 
-// Capture foreground window + caret/cursor position into globals.
-// Called from the hook proc — must be fast.
-static void CapturePickerTrigger() {
-    g_prevFocus = GetForegroundWindow();
-    g_anchorPt  = {};
-    DWORD fgTid = GetWindowThreadProcessId(g_prevFocus, nullptr);
-    if (!fgTid) return;
+// Capture foreground window + caret/cursor position. Called from the hook
+// proc — must be fast. Returns a heap-allocated PickerTrigger (caller owns).
+static PickerTrigger* CapturePickerTrigger() {
+    auto* t = new PickerTrigger{};
+    t->prevFocus = GetForegroundWindow();
+    DWORD fgTid = GetWindowThreadProcessId(t->prevFocus, nullptr);
+    if (!fgTid) return t;
     GUITHREADINFO gti = {sizeof(gti)};
     if (GetGUIThreadInfo(fgTid, &gti) && gti.hwndCaret) {
         // rcCaret is in client coords of hwndCaret — convert to screen
         POINT pt = {gti.rcCaret.left, gti.rcCaret.bottom};
         ClientToScreen(gti.hwndCaret, &pt);
-        g_anchorPt = pt;
+        t->anchorPt = pt;
         Wh_Log(L"Picker trigger: caret at (%d,%d)", pt.x, pt.y);
     } else {
-        GetCursorPos(&g_anchorPt);
-        Wh_Log(L"Picker trigger: no caret, cursor at (%d,%d)", g_anchorPt.x, g_anchorPt.y);
+        GetCursorPos(&t->anchorPt);
+        Wh_Log(L"Picker trigger: no caret, cursor at (%d,%d)", t->anchorPt.x, t->anchorPt.y);
     }
+    return t;
 }
 
 static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
@@ -2696,9 +2724,10 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     if (g_hwnd && IsWindowVisible(g_hwnd))
                         PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
                     else {
-                        CapturePickerTrigger();
+                        auto* trig = CapturePickerTrigger();
                         AllowSetForegroundWindow(GetCurrentProcessId());
-                        if (g_hwnd) PostMessage(g_hwnd, WM_SHOW_PICKER, 0, 0);
+                        if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
+                            delete trig;
                     }
                     return 1;  // block the key
                 } else if ((g_winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)) && g_blockWinDot) {
@@ -2710,9 +2739,10 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     if (g_hwnd && IsWindowVisible(g_hwnd))
                         PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
                     else {
-                        CapturePickerTrigger();
+                        auto* trig = CapturePickerTrigger();
                         AllowSetForegroundWindow(GetCurrentProcessId());
-                        if (g_hwnd) PostMessage(g_hwnd, WM_SHOW_PICKER, 0, 0);
+                        if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
+                            delete trig;
                     }
                     // Inject a neutral VK_F23 down+up so Windows sees that Win
                     // was pressed in combination with another key.  Without this,
@@ -2733,9 +2763,10 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                 if (g_hwnd && IsWindowVisible(g_hwnd))
                     PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
                 else {
-                    CapturePickerTrigger();
+                    auto* trig = CapturePickerTrigger();
                     AllowSetForegroundWindow(GetCurrentProcessId());
-                    if (g_hwnd) PostMessage(g_hwnd, WM_SHOW_PICKER, 0, 0);
+                    if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
+                        delete trig;
                 }
                 return 1;  // block Ctrl+Space
             }
