@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
-// @version         1.2
+// @version         1.3
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
