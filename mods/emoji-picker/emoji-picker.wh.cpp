@@ -2463,6 +2463,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
     case WM_DESTROY:
         if (g_hFont)  { DeleteObject(g_hFont);  g_hFont  = nullptr; }
         if (g_hbEdit) { DeleteObject(g_hbEdit); g_hbEdit = nullptr; }
@@ -2471,6 +2475,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SafeRelease(&g_emojiFmt);
         SafeRelease(&g_tabFmt);
         DiscardDeviceResources();
+        // Clear the global BEFORE the handle becomes recyclable, and post
+        // WM_QUIT so the worker thread's GetMessage loop exits even if we
+        // got here via WM_CLOSE (Wh_ModUninit path) rather than WM_QUIT.
+        g_hwnd = nullptr;
+        PostQuitMessage(0);
         return 0;
 
     case WM_SHOW_PICKER:
@@ -2831,11 +2840,25 @@ void Wh_ModSettingsChanged() {
 
 void Wh_ModUninit() {
     Wh_Log(L"Emoji Picker: uninit");
-    if (g_hwnd)   PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+
+    // Uninstall the LL keyboard hook FIRST, before anything else. Once
+    // UnhookWindowsHookEx returns, the OS guarantees no new KbHookProc
+    // invocations — which means it's safe for the DLL to go away even if
+    // the worker thread is wedged. Calling Unhook from a thread other than
+    // the one that installed the hook is explicitly supported.
+    if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+
+    if (g_hwnd)     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
     if (g_threadId) PostThreadMessage(g_threadId, WM_QUIT, 0, 0);
     if (g_thread) {
-        WaitForSingleObject(g_thread, 5000);
-        CloseHandle(g_thread);
+        if (WaitForSingleObject(g_thread, 5000) == WAIT_TIMEOUT) {
+            // Thread did not exit. The hook is already gone so no keystroke
+            // can hit unmapped code, but we still leak the thread handle +
+            // window rather than risk TerminateThread corrupting process state.
+            Wh_Log(L"EmojiThread did not exit in 5s — hook already uninstalled, leaking thread handle");
+        } else {
+            CloseHandle(g_thread);
+        }
         g_thread = nullptr;
     }
 }
