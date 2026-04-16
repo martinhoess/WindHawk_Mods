@@ -2086,6 +2086,9 @@ static void DiscardDeviceResources() {
 
 static HRESULT CreateDeviceResources(HWND hwnd) {
     if (g_rt) return S_OK;
+    // Factory can legitimately be null if EmojiThread's early init failed
+    // (e.g. graphics subsystem unavailable). Don't null-deref it.
+    if (!g_d2dFact) return E_FAIL;
     UINT dpi = GetDpiForWindow(hwnd);
     if (!dpi) dpi = 96;
     UINT physW = MulDiv(WIN_W, dpi, 96);
@@ -2819,10 +2822,22 @@ static DWORD WINAPI EmojiThread(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    // D2D / DWrite factories
-    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2dFact);
-    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-        __uuidof(IDWriteFactory), (IUnknown**)&g_dwFact);
+    // D2D / DWrite factories — if either fails we can't render, so bail
+    // straight to cleanup rather than creating a window that will crash on
+    // first paint.
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2dFact))
+        || !g_d2dFact) {
+        Wh_Log(L"D2D1CreateFactory failed");
+        if (g_hookReady) SetEvent(g_hookReady);
+        goto cleanup;
+    }
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory), (IUnknown**)&g_dwFact))
+        || !g_dwFact) {
+        Wh_Log(L"DWriteCreateFactory failed");
+        if (g_hookReady) SetEvent(g_hookReady);
+        goto cleanup;
+    }
 
     // Register window class
     WNDCLASSEXW wc = {sizeof(wc)};
