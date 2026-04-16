@@ -35,6 +35,7 @@
 #include <dwrite.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -1792,12 +1793,18 @@ static bool   g_inserting  = false;
 enum class AltShortcut { CtrlPeriod, CtrlSpace, AltPeriod, Disabled };
 
 static UINT   g_dpi              = 96;
-static bool   g_winDown          = false;
-static bool   g_ctrlDown         = false;  // tracks Ctrl key state
-static bool   g_altDown          = false;  // tracks Alt key state
-static bool   g_blockWinDot      = true;   // setting: intercept Win+.
-static AltShortcut g_altShortcut = AltShortcut::CtrlPeriod;  // setting: custom shortcut
-static bool   g_suppressPeriodUp = false;  // block Period keyup after intercepting Win+.
+// These flags are read by KbHookProc on whatever thread the OS dispatches the
+// low-level hook on, and written by ReadSettings / ShowPickerAt / the hook
+// itself on other threads. std::atomic (relaxed) prevents the compiler from
+// caching stale values in a register across the hook proc's long if-chain —
+// aligned reads/writes are already tear-free on x64, cost is a plain mov.
+static std::atomic<bool>   g_winDown          {false};
+static std::atomic<bool>   g_ctrlDown         {false};  // tracks Ctrl key state
+static std::atomic<bool>   g_altDown          {false};  // tracks Alt key state
+static std::atomic<bool>   g_blockWinDot      {true};   // setting: intercept Win+.
+static std::atomic<AltShortcut> g_altShortcut {AltShortcut::CtrlPeriod};  // setting: custom shortcut
+static std::atomic<bool>   g_suppressPeriodUp {false};  // block Period keyup after intercepting Win+.
+static std::atomic<bool>   g_hideFlags        {false};  // setting: hide flags category (declared early; old definition removed below)
 static POINT  g_anchorPt         = {};     // caret/cursor pos captured at hook time
 
 static int    g_cat        = 1;
@@ -1806,7 +1813,7 @@ static int    g_hoverIdx   = -1;
 static int    g_hoverTab   = -1;
 static bool   g_keyboardNav  = false;   // suppress mouse hover while keyboard is navigating
 static POINT  g_lastMousePos = {-1,-1}; // detect real vs synthetic WM_MOUSEMOVE
-static bool   g_hideFlags    = false;   // setting: hide flags category
+// g_hideFlags moved into the atomic block above (read by KbHookProc).
 static int    g_hoverRecent  = -1;      // hover index in recent quick-pick row
 
 static std::vector<int>               g_filtered;
@@ -2670,9 +2677,10 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                 if (g_winDown && !((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000))
                     g_winDown = false;
 
+                AltShortcut shortcut = g_altShortcut.load(std::memory_order_relaxed);
                 bool customShortcut =
-                    (g_altShortcut == AltShortcut::CtrlPeriod && g_ctrlDown) ||
-                    (g_altShortcut == AltShortcut::AltPeriod  && g_altDown);
+                    (shortcut == AltShortcut::CtrlPeriod && g_ctrlDown) ||
+                    (shortcut == AltShortcut::AltPeriod  && g_altDown);
                 if (customShortcut) {
                     if (g_hwnd && IsWindowVisible(g_hwnd))
                         PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
@@ -2708,7 +2716,7 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     return 1;  // block period keydown
                 }
             } else if (k->vkCode == VK_SPACE &&
-                       g_altShortcut == AltShortcut::CtrlSpace && g_ctrlDown &&
+                       g_altShortcut.load(std::memory_order_relaxed) == AltShortcut::CtrlSpace && g_ctrlDown &&
                        ((GetAsyncKeyState(VK_LCONTROL) | GetAsyncKeyState(VK_RCONTROL)) & 0x8000)) {
                 if (g_hwnd && IsWindowVisible(g_hwnd))
                     PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
@@ -2823,7 +2831,7 @@ static void ReadSettings() {
     else                                     g_altShortcut = AltShortcut::CtrlPeriod;
     Wh_FreeStringSetting(s);
     Wh_Log(L"Settings: blockWinDot=%d shortcut=%d hideFlags=%d",
-        (int)g_blockWinDot, (int)g_altShortcut, (int)g_hideFlags);
+        (int)g_blockWinDot.load(), (int)g_altShortcut.load(), (int)g_hideFlags.load());
 }
 
 BOOL Wh_ModInit() {
