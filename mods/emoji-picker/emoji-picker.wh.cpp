@@ -2267,6 +2267,21 @@ static void DoInsert() {
     g_inserting = false;
 }
 
+// Hand focus back to the app that had it before the picker opened. Returns
+// false if the source window is gone or foreground is still us — callers
+// must not inject characters in that case, otherwise SendInput ends up
+// typing into the picker's own search edit.
+static bool RestorePrevFocus() {
+    if (!g_prevFocus || !IsWindow(g_prevFocus) || g_prevFocus == g_hwnd)
+        return false;
+    SetForegroundWindow(g_prevFocus);
+    // After SW_HIDE the picker should no longer be foreground; if it still
+    // is, our SetForegroundWindow call was refused (no AllowSetForegroundWindow
+    // for this caller). Abort the insert rather than typing into ourselves.
+    HWND fg = GetForegroundWindow();
+    return fg != g_hwnd;
+}
+
 static void SelectEmoji(int filteredIdx) {
     if (filteredIdx < 0 || filteredIdx >= (int)g_filtered.size()) return;
     const wchar_t* ch = g_emojis[g_filtered[filteredIdx]].ch;
@@ -2277,8 +2292,12 @@ static void SelectEmoji(int filteredIdx) {
 
     ShowWindow(g_hwnd, SW_HIDE);
 
-    if (g_prevFocus && IsWindow(g_prevFocus))
-        SetForegroundWindow(g_prevFocus);
+    if (!RestorePrevFocus()) {
+        // Focus handoff failed — abort insert to avoid typing into the picker.
+        g_pending.clear();
+        g_inserting = false;
+        return;
+    }
 
     // Process insertion after message pump gives focus time to transfer
     PostMessage(g_hwnd, WM_INSERT_EMOJI, 0, 0);
@@ -2290,8 +2309,11 @@ static void SelectEmojiCh(const std::wstring& ch) {
     g_pending   = copy;
     g_inserting = true;
     ShowWindow(g_hwnd, SW_HIDE);
-    if (g_prevFocus && IsWindow(g_prevFocus))
-        SetForegroundWindow(g_prevFocus);
+    if (!RestorePrevFocus()) {
+        g_pending.clear();
+        g_inserting = false;
+        return;
+    }
     PostMessage(g_hwnd, WM_INSERT_EMOJI, 0, 0);
 }
 
