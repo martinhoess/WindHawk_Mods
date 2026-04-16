@@ -1733,6 +1733,7 @@ constexpr UINT WM_INSERT_EMOJI  = WM_USER + 2;
 constexpr UINT WM_HIDE_PICKER   = WM_USER + 3;
 constexpr UINT WM_WARMUP        = WM_USER + 4;
 constexpr UINT WM_LAYOUTS_READY = WM_USER + 5;
+constexpr UINT WM_SYNTH_F23     = WM_USER + 6;  // hand-off so SendInput runs off the hook thread
 constexpr int  IDC_SEARCH       = 1;
 
 static const wchar_t* PICKER_WNDCLASS = L"WindhawkEmojiPicker";
@@ -2402,6 +2403,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowWindow(hwnd, SW_HIDE);
         return 0;
 
+    case WM_SYNTH_F23: {
+        // Run SendInput on the worker thread so the hook proc stays fast.
+        INPUT inp[2] = {};
+        inp[0].type = INPUT_KEYBOARD; inp[0].ki.wVk = VK_F23;
+        inp[1].type = INPUT_KEYBOARD; inp[1].ki.wVk = VK_F23;
+        inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, inp, sizeof(INPUT));
+        return 0;
+    }
+
     case WM_WARMUP: {
         HANDLE h = CreateThread(nullptr, 0, WarmupWorker, nullptr, 0, nullptr);
         if (h) CloseHandle(h);
@@ -2707,11 +2718,12 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     // was pressed in combination with another key.  Without this,
                     // the system observes Win↓ … Win↑ with no other key in
                     // between and opens the Start menu after our picker appears.
-                    INPUT inp[2] = {};
-                    inp[0].type = INPUT_KEYBOARD; inp[0].ki.wVk = VK_F23;
-                    inp[1].type = INPUT_KEYBOARD; inp[1].ki.wVk = VK_F23;
-                    inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                    SendInput(2, inp, sizeof(INPUT));
+                    //
+                    // SendInput must NOT run on the hook thread: it synchronously
+                    // walks the hook chain (our own hook too — filtered by
+                    // LLKHF_INJECTED) and the time counts against the ~300 ms
+                    // LowLevelHooksTimeout budget. Hand off to the worker thread.
+                    if (g_hwnd) PostMessage(g_hwnd, WM_SYNTH_F23, 0, 0);
                     g_suppressPeriodUp = true;
                     return 1;  // block period keydown
                 }
