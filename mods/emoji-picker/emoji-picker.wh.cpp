@@ -1789,6 +1789,7 @@ static HWND   g_searchEdit = nullptr;
 static HHOOK  g_kbHook     = nullptr;
 static DWORD  g_threadId   = 0;
 static HANDLE g_thread     = nullptr;
+static HANDLE g_hookReady  = nullptr;  // signalled after SetWindowsHookExW attempt
 static HWND   g_prevFocus  = nullptr;
 static bool   g_inserting  = false;
 enum class AltShortcut { CtrlPeriod, CtrlSpace, AltPeriod, Disabled };
@@ -2843,12 +2844,16 @@ static DWORD WINAPI EmojiThread(LPVOID) {
 
     if (!g_hwnd) {
         Wh_Log(L"Failed to create picker window");
+        if (g_hookReady) SetEvent(g_hookReady);  // unblock Wh_ModInit on failure
         goto cleanup;
     }
 
     // Install global keyboard hook
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHookProc, nullptr, 0);
     if (!g_kbHook) Wh_Log(L"Failed to install keyboard hook");
+    // Tell Wh_ModInit whether the hook came up, so the mod reports success
+    // only once Win+. is actually intercepted.
+    if (g_hookReady) SetEvent(g_hookReady);
 
     Wh_Log(L"Emoji picker ready, %d emoji loaded", g_emojiCount);
 
@@ -2902,8 +2907,38 @@ static void ReadSettings() {
 BOOL Wh_ModInit() {
     Wh_Log(L"Emoji Picker: init");
     ReadSettings();
+    // Manual-reset event so we can wait across thread startup without timing
+    // the worker thread against the hook install.
+    g_hookReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_thread = CreateThread(nullptr, 0, EmojiThread, nullptr, 0, &g_threadId);
-    return g_thread != nullptr;
+    if (!g_thread) {
+        if (g_hookReady) { CloseHandle(g_hookReady); g_hookReady = nullptr; }
+        return FALSE;
+    }
+    // Wait up to 2s for the worker to report hook-install outcome.  Returning
+    // success here means the user can press Win+. immediately after enabling
+    // the mod and have it work — rather than sometimes falling through to the
+    // system emoji dialog during the race window.
+    if (g_hookReady) {
+        WaitForSingleObject(g_hookReady, 2000);
+        CloseHandle(g_hookReady);
+        g_hookReady = nullptr;
+    }
+    if (!g_kbHook) {
+        Wh_Log(L"Wh_ModInit: keyboard hook not active — reporting failure");
+        // Tear down the worker we already started: post quit + close the
+        // picker window, wait briefly. Otherwise Windhawk sees init-fail but
+        // we keep a thread + window running for the life of the process.
+        if (g_hwnd)     PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+        if (g_threadId) PostThreadMessage(g_threadId, WM_QUIT, 0, 0);
+        if (g_thread) {
+            WaitForSingleObject(g_thread, 2000);
+            CloseHandle(g_thread);
+            g_thread = nullptr;
+        }
+        return FALSE;
+    }
+    return TRUE;
 }
 
 void Wh_ModSettingsChanged() {
