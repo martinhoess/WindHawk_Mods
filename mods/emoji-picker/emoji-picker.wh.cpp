@@ -2843,13 +2843,15 @@ static DWORD WINAPI EmojiThread(LPVOID) {
     }
 
     // Register window class
-    WNDCLASSEXW wc = {sizeof(wc)};
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = GetModuleHandle(nullptr);
-    wc.lpszClassName = PICKER_WNDCLASS;
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.style         = CS_DROPSHADOW;
-    RegisterClassExW(&wc);
+    {
+        WNDCLASSEXW wc = {sizeof(wc)};
+        wc.lpfnWndProc   = WndProc;
+        wc.hInstance     = GetModuleHandle(nullptr);
+        wc.lpszClassName = PICKER_WNDCLASS;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.style         = CS_DROPSHADOW;
+        RegisterClassExW(&wc);
+    }
 
     // Create picker window (hidden)
     g_hwnd = CreateWindowExW(
