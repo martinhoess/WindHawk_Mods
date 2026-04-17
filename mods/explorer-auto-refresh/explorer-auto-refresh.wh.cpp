@@ -651,15 +651,36 @@ BOOL Wh_ModInit() {
     g_monitorStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_watcherStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_monitorStopEvent || !g_watcherStopEvent) {
+        // If only one of the two CreateEventW calls succeeded, the other leaks
+        // for the lifetime of explorer.exe — Windhawk does not call Uninit when
+        // Init returns FALSE. Close whichever handle we did get.
+        if (g_monitorStopEvent) { CloseHandle(g_monitorStopEvent); g_monitorStopEvent = nullptr; }
+        if (g_watcherStopEvent) { CloseHandle(g_watcherStopEvent); g_watcherStopEvent = nullptr; }
         Wh_Log(L"Failed to create stop events");
         return FALSE;
     }
 
+    // Create threads one at a time so we can cleanly roll back if the second
+    // make_unique throws. If we returned FALSE while a thread was still
+    // running, Windhawk would unload the DLL under it — the thread's code
+    // pages would become unmapped and the next callback would crash explorer.
     try {
         g_eventMonitorThread = std::make_unique<std::thread>(EventMonitorThread);
+    } catch (...) {
+        Wh_Log(L"Failed to create event monitor thread");
+        CloseHandle(g_monitorStopEvent); g_monitorStopEvent = nullptr;
+        CloseHandle(g_watcherStopEvent); g_watcherStopEvent = nullptr;
+        return FALSE;
+    }
+    try {
         g_fileWatcherThread  = std::make_unique<std::thread>(FileWatcherThread);
     } catch (...) {
-        Wh_Log(L"Failed to create threads");
+        Wh_Log(L"Failed to create file watcher thread");
+        SetEvent(g_monitorStopEvent);
+        if (g_eventMonitorThread->joinable()) g_eventMonitorThread->join();
+        g_eventMonitorThread.reset();
+        CloseHandle(g_monitorStopEvent); g_monitorStopEvent = nullptr;
+        CloseHandle(g_watcherStopEvent); g_watcherStopEvent = nullptr;
         return FALSE;
     }
 
