@@ -527,12 +527,27 @@ void FileWatcherThread() {
                 }
             }
 
+            // Count currently-open handles so we don't allocate kernel
+            // change-notification objects we can never wait on (the wait
+            // array is capped at MAX_WATCHED_DIRS).
+            int watched = 0;
+            for (auto& [normPath, watcher] : g_watchedDirs)
+                if (watcher.changeHandle) watched++;
+
             // Open notification handles for newly tracked directories.
             for (auto& [normPath, watcher] : g_watchedDirs) {
                 if (watcher.changeHandle || watcher.watchFailed || watcher.windows.empty())
                     continue;
 
                 if (!g_watchNetworkDrives && IsNetworkPath(watcher.path)) {
+                    continue;
+                }
+
+                if (watched >= MAX_WATCHED_DIRS) {
+                    // Intentionally NOT setting watchFailed — another watcher
+                    // may close later and free up a slot, at which point we
+                    // want to retry this directory.
+                    Wh_Log(L"Watch cap reached — not opening %s", watcher.path.c_str());
                     continue;
                 }
 
@@ -558,6 +573,7 @@ void FileWatcherThread() {
                     watcher.changeHandle    = h;
                     watcher.lastRefreshTime = 0;
                     watcher.watchStartTime  = GetTickCount();
+                    watched++;
                     Wh_Log(L"Started watching: %s", watcher.path.c_str());
                 } else {
                     Wh_Log(L"Failed to watch: %s (err %u)", watcher.path.c_str(), GetLastError());
