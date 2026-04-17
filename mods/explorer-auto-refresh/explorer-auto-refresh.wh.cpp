@@ -448,10 +448,19 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
                                    LONG idObject, LONG idChild, DWORD, DWORD) {
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
 
-    wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
-    if (wcscmp(cls, L"CabinetWClass") != 0 &&
-        wcscmp(cls, L"ExploreWClass")  != 0) return;
+    // Only filter by class name for events where the window is still alive.
+    // EVENT_OBJECT_DESTROY arrives after the HWND has been destroyed (events
+    // are delivered out-of-context via the thread's message queue), so
+    // GetClassNameW returns 0 and leaves `cls` empty, which would match
+    // neither CabinetWClass nor ExploreWClass — the destroy event for a
+    // real Explorer window would always be discarded. Let destroys through;
+    // RefreshWindowSinks decides which HWNDs are genuine Explorer windows.
+    if (event != EVENT_OBJECT_DESTROY) {
+        wchar_t cls[64] = {};
+        GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+        if (wcscmp(cls, L"CabinetWClass") != 0 &&
+            wcscmp(cls, L"ExploreWClass")  != 0) return;
+    }
 
     // No per-event logging — too noisy. Windhawk log is always active.
 
