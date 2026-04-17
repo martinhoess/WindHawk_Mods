@@ -131,12 +131,22 @@ struct WindowSink {
     DWORD cookie;
 };
 
+// Per-window tracked path. The original form is kept for user-facing logs
+// and API calls that want the real casing; the normalized form is the key
+// used to look up the watcher in g_watchedDirs. Previously this was a
+// std::pair which forced callers to remember which of first/second was
+// which — a named struct eliminates that class of bug.
+struct WindowPath {
+    std::wstring original;
+    std::wstring normalized;
+};
+
 // Shared between EventMonitorThread and FileWatcherThread (protected by g_stateMutex).
 std::mutex g_stateMutex;
 std::unordered_map<std::wstring, DirectoryWatcher> g_watchedDirs;  // key = normalizedPath
 
 // EventMonitorThread-only state (single STA thread — no mutex needed).
-std::unordered_map<WindowKey, std::pair<std::wstring, std::wstring>> g_windowPaths;
+std::unordered_map<WindowKey, WindowPath> g_windowPaths;
 std::unordered_map<WindowKey, WindowSink> g_windowSinks;
 
 std::unique_ptr<std::thread> g_eventMonitorThread;
@@ -225,9 +235,9 @@ static void SyncWatchListLocked() {
         watcher.windows.clear();
 
     for (const auto& [wk, paths] : g_windowPaths) {
-        auto& entry = g_watchedDirs[paths.second];
+        auto& entry = g_watchedDirs[paths.normalized];
         if (entry.path.empty())
-            entry.path = paths.first;
+            entry.path = paths.original;
         entry.windows.push_back(wk);
     }
 
@@ -315,7 +325,7 @@ static void OnWindowNavigated(WindowKey wk, const std::wstring& newPath) {
     auto it = g_windowPaths.find(wk);
     if (it == g_windowPaths.end()) return;
     Wh_Log(L"Navigate: %p  %s -> %s",
-           (HWND)wk, it->second.first.c_str(), newPath.c_str());
+           (HWND)wk, it->second.original.c_str(), newPath.c_str());
     it->second = {newPath, NormalizePath(newPath)};
     SyncWatchList();
 }
@@ -439,9 +449,9 @@ static void RefreshWindowSinks() {
                     if (it == g_windowPaths.end()) {
                         g_windowPaths[wk] = {path, NormalizePath(path)};
                         Wh_Log(L"New window: %p -> %s", hwnd, path.c_str());
-                    } else if (it->second.first != path) {
+                    } else if (it->second.original != path) {
                         Wh_Log(L"Tab switched: %p  %s -> %s",
-                               hwnd, it->second.first.c_str(), path.c_str());
+                               hwnd, it->second.original.c_str(), path.c_str());
                         it->second = {path, NormalizePath(path)};
                     }
                 }
@@ -468,7 +478,7 @@ static void RefreshWindowSinks() {
         auto pathIt = g_windowPaths.find(wk);
         Wh_Log(L"Window closed: %p (%s)",
                (HWND)wk,
-               pathIt != g_windowPaths.end() ? pathIt->second.first.c_str() : L"<no path>");
+               pathIt != g_windowPaths.end() ? pathIt->second.original.c_str() : L"<no path>");
         if (pathIt != g_windowPaths.end()) g_windowPaths.erase(pathIt);
         UnregisterWindowSink(wk);
     }
