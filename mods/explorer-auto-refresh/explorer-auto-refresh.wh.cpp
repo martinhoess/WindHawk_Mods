@@ -2,7 +2,7 @@
 // @id              explorer-auto-refresh
 // @name            Explorer Auto Refresh
 // @description     Automatically refreshes Explorer folder views when files change, restoring classic Windows behavior
-// @version         1.3
+// @version         1.4
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
