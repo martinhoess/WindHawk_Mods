@@ -409,7 +409,18 @@ static void RefreshWindowSinks() {
             // get_HWND returns a stable HWND — unlike wb's proxy address, which
             // is a new COM proxy object on every CoCreateInstance call.
             SHANDLE_PTR hwndLong = 0;
-            wb->get_HWND(&hwndLong);
+            HRESULT hrHwnd = wb->get_HWND(&hwndLong);
+            if (FAILED(hrHwnd)) {
+                // Rare — typically an explorer window mid-teardown. Log and
+                // skip this item so we don't try to register a sink against
+                // a null HWND and pollute g_windowSinks with an empty key.
+                Wh_Log(L"IWebBrowser2::get_HWND failed on item %ld: 0x%08lx",
+                       i, hrHwnd);
+                wb->Release();
+                disp->Release();
+                VariantClear(&vI);
+                continue;
+            }
             HWND hwnd = (HWND)(LONG_PTR)hwndLong;
 
             if (hwnd) {
