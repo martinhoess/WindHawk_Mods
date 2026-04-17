@@ -564,8 +564,30 @@ void FileWatcherThread() {
     int handleCount = 0;
 
   try {
+    // Tracks the previous iteration's enabled state so we can detect the
+    // true -> false transition and release every open change-notification
+    // handle. Without this, a user who "disables" the mod at runtime still
+    // holds kernel change-notification objects for every browsed folder
+    // until the owning Explorer window closes — defeating the purpose of
+    // disabling and wasting kernel handles.
+    bool wasEnabled = true;
+
     while (WaitForSingleObject(g_watcherStopEvent, 100) == WAIT_TIMEOUT) {
-        if (!g_enabled) {
+        bool nowEnabled = g_enabled.load();
+        if (wasEnabled && !nowEnabled) {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            for (auto& [normPath, watcher] : g_watchedDirs) {
+                if (watcher.changeHandle) {
+                    FindCloseChangeNotification(watcher.changeHandle);
+                    watcher.changeHandle = nullptr;
+                    watcher.lastRefreshTime = 0;
+                }
+            }
+            Wh_Log(L"Auto refresh disabled — closed all change handles");
+        }
+        wasEnabled = nowEnabled;
+
+        if (!nowEnabled) {
             Sleep(100);
             continue;
         }
