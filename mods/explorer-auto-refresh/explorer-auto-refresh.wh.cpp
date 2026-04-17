@@ -263,7 +263,14 @@ public:
         return n;
     }
     STDMETHOD(QueryInterface)(REFIID riid, void** ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IDispatch) {
+        // Also advertise the source interface ID (DWebBrowserEvents2). COM
+        // clients that call Advise via IConnectionPoint never QI for it, but
+        // hypothetical out-of-process marshalling wrappers may, and denying
+        // it silently stops events from flowing. Zero extra risk — the sink
+        // already conforms to the interface's layout via IDispatch dispatch.
+        if (riid == IID_IUnknown ||
+            riid == IID_IDispatch ||
+            riid == s_DIID_DWebBrowserEvents2) {
             *ppv = static_cast<IDispatch*>(this);
             AddRef();
             return S_OK;
