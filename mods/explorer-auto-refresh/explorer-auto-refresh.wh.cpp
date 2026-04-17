@@ -98,8 +98,15 @@ static void LoadSettings() {
 
 constexpr int    MAX_WATCHED_DIRS = 60;
 constexpr DISPID kNavigateComplete2 = 252;  // DWebBrowserEvents2::NavigateComplete2
-constexpr UINT   kSafetyTimerId  = 1;  // 1-second periodic full rescan
-constexpr UINT   kRefreshTimerId = 2;  // 100-ms debounce for WinEvent-triggered rescans
+
+// SetTimer(NULL, ...) ignores nIDEvent and returns a system-generated ID. We
+// must store the returned IDs so KillTimer and the WM_TIMER wParam comparisons
+// use the real values. Atomics because WinEventProc (see below) and the
+// EventMonitorThread message pump both read/write g_refreshTimer. Both run on
+// the same STA thread today, but WINEVENT_OUTOFCONTEXT semantics don't
+// guarantee future marshalling, and atomics are cheap.
+static std::atomic<UINT_PTR> g_safetyTimer{0};
+static std::atomic<UINT_PTR> g_refreshTimer{0};
 
 // {34A715A0-6587-11D0-924A-0020AFC7AC4D}
 static const GUID s_DIID_DWebBrowserEvents2 =
@@ -410,7 +417,11 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 
     // Debounce: reset a 100-ms countdown. Rapid events (e.g. multiple NAMECHANGE
     // callbacks per tab switch) coalesce into a single RefreshWindowSinks() call.
-    SetTimer(nullptr, kRefreshTimerId, 100, nullptr);
+    // SetTimer(NULL, ...) ignores nIDEvent — must store the returned ID so we can
+    // kill the previous pending timer and match it in the message pump.
+    UINT_PTR prev = g_refreshTimer.exchange(0);
+    if (prev) KillTimer(nullptr, prev);
+    g_refreshTimer = SetTimer(nullptr, 0, 100, nullptr);
 }
 
 void EventMonitorThread() {
@@ -437,7 +448,7 @@ void EventMonitorThread() {
     else
         Wh_Log(L"WinEvent hooks registered");
 
-    SetTimer(nullptr, kSafetyTimerId, 1000, nullptr);
+    g_safetyTimer = SetTimer(nullptr, 0, 1000, nullptr);
 
     MSG msg;
     while (true) {
@@ -446,10 +457,11 @@ void EventMonitorThread() {
         if (r == WAIT_OBJECT_0) break;
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_TIMER) {
-                if (msg.wParam == kSafetyTimerId) {
+                if (msg.wParam == g_safetyTimer.load()) {
                     RefreshWindowSinks();
-                } else if (msg.wParam == kRefreshTimerId) {
-                    KillTimer(nullptr, kRefreshTimerId);
+                } else if (msg.wParam == g_refreshTimer.load()) {
+                    UINT_PTR id = g_refreshTimer.exchange(0);
+                    if (id) KillTimer(nullptr, id);
                     RefreshWindowSinks();
                 }
             }
@@ -458,8 +470,8 @@ void EventMonitorThread() {
         }
     }
 
-    KillTimer(nullptr, kSafetyTimerId);
-    KillTimer(nullptr, kRefreshTimerId);
+    if (UINT_PTR t = g_safetyTimer.exchange(0))  KillTimer(nullptr, t);
+    if (UINT_PTR t = g_refreshTimer.exchange(0)) KillTimer(nullptr, t);
     if (hookShow)       UnhookWinEvent(hookShow);
     if (hookDestroy)    UnhookWinEvent(hookDestroy);
     if (hookNameChange) UnhookWinEvent(hookNameChange);
