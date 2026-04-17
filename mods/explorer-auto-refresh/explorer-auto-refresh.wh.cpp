@@ -798,7 +798,28 @@ void Wh_ModUninit() {
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
+    // Capture old state BEFORE LoadSettings overwrites the atomics so we can
+    // detect a WatchNetworkDrives true -> false transition. Without this, the
+    // user disabling network watching leaves already-open network change
+    // handles armed — they continue to fire refreshes until the owning
+    // Explorer window closes, contradicting the UX of "disable means stop".
+    bool oldNet = g_watchNetworkDrives.load();
+
     LoadSettings();
+
+    if (oldNet && !g_watchNetworkDrives.load()) {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        for (auto& [normPath, watcher] : g_watchedDirs) {
+            if (watcher.changeHandle && IsNetworkPath(watcher.path)) {
+                FindCloseChangeNotification(watcher.changeHandle);
+                watcher.changeHandle = nullptr;
+                watcher.lastRefreshTime = 0;
+                Wh_Log(L"Closed network watcher on settings change: %s",
+                       watcher.path.c_str());
+            }
+        }
+    }
+
     Wh_Log(L"Settings updated: enabled=%d debounce=%ums network=%d",
            g_enabled.load(), g_debounceMs.load(), g_watchNetworkDrives.load());
     *bReload = FALSE;
