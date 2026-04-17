@@ -184,7 +184,16 @@ static std::wstring StripTrailingSlash(std::wstring path) {
 static std::wstring NormalizePath(const std::wstring& path) {
     if (path.empty()) return L"";
     std::wstring n = StripTrailingSlash(path);
-    for (auto& c : n) c = towlower(c);
+    // ASCII-only fold: towlower is locale-sensitive. Under tr-TR, L'I' maps
+    // to L'ı' (dotless i), so two paths that differ only in the casing of an
+    // ASCII 'I' would normalise to different keys and the watcher wouldn't
+    // match. Windows file paths are case-insensitive but NOT locale-aware,
+    // so ASCII fold is both safer and semantically closer to what the OS
+    // itself does for filesystem comparisons.
+    for (auto& c : n) {
+        if (c >= L'A' && c <= L'Z')
+            c = c + (L'a' - L'A');
+    }
     return n;
 }
 
