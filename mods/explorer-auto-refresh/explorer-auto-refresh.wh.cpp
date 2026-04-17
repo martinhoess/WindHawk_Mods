@@ -201,6 +201,16 @@ static bool IsNetworkPath(const std::wstring& path) {
 // ============================================================================
 
 static void SyncWatchListLocked() {
+    // Snapshot pre-sync window counts so we can detect the 0->1 transition
+    // and restart the grace-period clock. Without this, reopening a folder
+    // whose watcher is still alive (e.g. rapid close+reopen of the same
+    // path) inherits an expired clock and loses grace-period protection
+    // against the white-flash during view initialisation.
+    std::unordered_map<std::wstring, bool> hadWindows;
+    hadWindows.reserve(g_watchedDirs.size());
+    for (const auto& [normPath, watcher] : g_watchedDirs)
+        hadWindows[normPath] = !watcher.windows.empty();
+
     for (auto& [normPath, watcher] : g_watchedDirs)
         watcher.windows.clear();
 
@@ -209,6 +219,17 @@ static void SyncWatchListLocked() {
         if (entry.path.empty())
             entry.path = paths.first;
         entry.windows.push_back(wk);
+    }
+
+    // 0 -> 1 transition: watcher just gained its first window. Reset the
+    // grace clock so SHChangeNotify is suppressed for ~1.5 s while the
+    // view initialises.
+    DWORD now = GetTickCount();
+    for (auto& [normPath, watcher] : g_watchedDirs) {
+        auto prev = hadWindows.find(normPath);
+        bool hadBefore = (prev != hadWindows.end()) && prev->second;
+        if (!hadBefore && !watcher.windows.empty())
+            watcher.watchStartTime = now;
     }
 }
 
