@@ -724,8 +724,10 @@ void FileWatcherThread() {
                 // tab is still initializing its view, which would cause a white flash.
                 if (now - watcher.watchStartTime < 1500) continue;
                 if (now - watcher.lastRefreshTime >= debounce) {
-                    SHChangeNotify(SHCNE_UPDATEDIR,
-                                   SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                    // SHCNF_FLUSHNOWAIT is only meaningful paired with
+                    // SHCNF_FLUSH; on its own it's a no-op. Use SHCNF_PATHW
+                    // alone so the flag set reflects what's actually happening.
+                    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW,
                                    watcher.path.c_str(), nullptr);
                     Wh_Log(L"Refreshed: %s", watcher.path.c_str());
                     watcher.lastRefreshTime = 0;
