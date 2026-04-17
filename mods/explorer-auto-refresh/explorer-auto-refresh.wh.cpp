@@ -495,8 +495,11 @@ void EventMonitorThread() {
 
 void FileWatcherThread() {
   try {
+    // Slot 0 is the stop event; slots 1..MAX_WATCHED_DIRS are watcher handles.
+    // Both arrays need MAX_WATCHED_DIRS + 1 slots to actually hold the
+    // documented 60 watchers without out-of-bounds writes.
     HANDLE watcherHandles[MAX_WATCHED_DIRS + 1];
-    std::wstring dirKeys[MAX_WATCHED_DIRS];
+    std::wstring dirKeys[MAX_WATCHED_DIRS + 1];
     int handleCount = 0;
 
     while (WaitForSingleObject(g_watcherStopEvent, 100) == WAIT_TIMEOUT) {
@@ -566,7 +569,7 @@ void FileWatcherThread() {
             handleCount = 1;
             watcherHandles[0] = g_watcherStopEvent;
             for (auto& [normPath, watcher] : g_watchedDirs) {
-                if (watcher.changeHandle && handleCount < MAX_WATCHED_DIRS) {
+                if (watcher.changeHandle && handleCount <= MAX_WATCHED_DIRS) {
                     watcherHandles[handleCount] = watcher.changeHandle;
                     dirKeys[handleCount] = normPath;
                     handleCount++;
