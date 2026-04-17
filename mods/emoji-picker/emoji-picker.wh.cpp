@@ -1918,14 +1918,17 @@ static void UpdateFilter() {
 
     bool hasQ = g_query[0] != 0;
 
-    // ASCII portion of query for English name search (truncate at first non-ASCII char)
+    // ASCII portion of query for English name search (truncate at first non-ASCII char).
+    // g_query has already been invariant-lowered in WM_COMMAND/EN_CHANGE, so a simple
+    // A-Z range fold is enough here — we deliberately avoid tolower() which, like
+    // towlower(), is locale-sensitive (Turkish 'I' → 'ı' rather than 'i').
     char q8[128] = {};
     if (hasQ) {
         int j = 0;
         for (int i = 0; g_query[i] && j < 127; i++) {
             wchar_t wc = g_query[i];
             if (wc >= 128) break;
-            q8[j++] = (char)tolower((unsigned char)wc);
+            q8[j++] = (char)((wc >= L'A' && wc <= L'Z') ? (wc + 32) : wc);
         }
     }
 
@@ -2594,9 +2597,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (HIWORD(wp) == EN_CHANGE && LOWORD(wp) == IDC_SEARCH) {
             GetWindowTextW(g_searchEdit, g_query, ARRAYSIZE(g_query));
-            // to lowercase
-            for (int i = 0; g_query[i]; i++)
-                g_query[i] = (wchar_t)towlower(g_query[i]);
+            // Lowercase using the invariant locale. towlower() follows the
+            // thread's LC_CTYPE, which in the Turkish locale maps 'I' to 'ı'
+            // (dotless i, U+0131) rather than 'i' — breaking matches against
+            // the emoji table's English keywords. LCMapStringEx with
+            // LOCALE_NAME_INVARIANT performs a locale-independent lowercase
+            // so ASCII 'A'-'Z' always fold to 'a'-'z'.
+            int qlen = (int)wcslen(g_query);
+            if (qlen > 0) {
+                int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+                    g_query, qlen, g_query, ARRAYSIZE(g_query) - 1,
+                    nullptr, nullptr, 0);
+                if (n > 0) g_query[n] = L'\0';
+            }
             UpdateFilter();
         }
         return 0;
