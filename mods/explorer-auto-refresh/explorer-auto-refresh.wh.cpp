@@ -150,6 +150,7 @@ HANDLE g_watcherStopEvent = nullptr;
 
 static void OnWindowNavigated(WindowKey wk, const std::wstring& newPath);
 static void RefreshWindowSinks();
+static void UnregisterWindowSink(WindowKey wk);
 
 // ============================================================================
 // UTILITY: PATH HELPERS
@@ -305,14 +306,32 @@ static void OnWindowNavigated(WindowKey wk, const std::wstring& newPath) {
 
 // Registers a DWebBrowserEvents2 sink for wk. Only done once per HWND — the sink
 // survives tab switches and is only removed when the window closes.
+//
+// HWND-recycle defence: if a sink already exists for wk but its connection
+// point no longer matches the one returned by the current wb, the old Explorer
+// window was destroyed and the HWND value was reassigned to a new one. Tear
+// down the stale sink before registering against the new window, otherwise the
+// new window gets no navigation events until explorer restart.
 static void RegisterWindowSink(WindowKey wk, IWebBrowser2* wb) {
-    if (g_windowSinks.count(wk)) return;  // already registered
-
     IConnectionPointContainer* cpc = nullptr;
     if (FAILED(wb->QueryInterface(IID_PPV_ARGS(&cpc)))) return;
 
     IConnectionPoint* cp = nullptr;
     if (SUCCEEDED(cpc->FindConnectionPoint(s_DIID_DWebBrowserEvents2, &cp))) {
+        auto sinkIt = g_windowSinks.find(wk);
+        if (sinkIt != g_windowSinks.end()) {
+            if (sinkIt->second.cp == cp) {
+                // Already registered on the current window — nothing to do.
+                cp->Release();
+                cpc->Release();
+                return;
+            }
+            // Stale sink from a recycled HWND. Tear it down and fall through
+            // to re-register on the new wb's connection point.
+            Wh_Log(L"Stale sink for %p — HWND was recycled, re-registering", (HWND)wk);
+            UnregisterWindowSink(wk);
+        }
+
         auto* sink = new BrowserEventSink(wk);
         DWORD cookie = 0;
         if (SUCCEEDED(cp->Advise(sink, &cookie))) {
