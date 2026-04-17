@@ -157,7 +157,16 @@ static void UnregisterWindowSink(WindowKey wk);
 // ============================================================================
 
 static std::wstring StripTrailingSlash(std::wstring path) {
-    while (!path.empty() && path.back() == L'\\')
+    // Keep at least the first three characters intact. This preserves:
+    //   "C:\\" — drive root (stripping to "C:" is wrong; GetFileAttributesW
+    //            treats "C:" as the current directory on drive C, not the
+    //            root).
+    //   "\\\\" — UNC prefix fragment (stripping to empty would silently
+    //            route the path through GetFileAttributesW(L"") and mark
+    //            the watcher failed with a confusing log line).
+    // Callers that pass a longer UNC like "\\\\server\\share\\" still end
+    // up with "\\\\server\\share", which is what we want to use as a key.
+    while (path.size() > 3 && path.back() == L'\\')
         path.pop_back();
     return path;
 }
