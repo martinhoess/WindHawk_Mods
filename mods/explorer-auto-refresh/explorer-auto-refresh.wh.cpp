@@ -465,51 +465,67 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
 }
 
 void EventMonitorThread() {
-  try {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // Declare all resources outside the try block so the catch (...) handler's
+    // fall-through cleanup can still release them. Otherwise an exception
+    // anywhere in the main loop would leak WinEvent hooks, COM sinks, and
+    // the STA CoInitialize reference until explorer restart.
+    HWINEVENTHOOK hookShow = nullptr;
+    HWINEVENTHOOK hookDestroy = nullptr;
+    HWINEVENTHOOK hookNameChange = nullptr;
+    bool coInitialized = false;
 
-    RefreshWindowSinks();
+    try {
+        if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
+            coInitialized = true;
 
-    HWINEVENTHOOK hookShow = SetWinEventHook(
-        EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
-        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        RefreshWindowSinks();
 
-    HWINEVENTHOOK hookDestroy = SetWinEventHook(
-        EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY,
-        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        hookShow = SetWinEventHook(
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
-    HWINEVENTHOOK hookNameChange = SetWinEventHook(
-        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE,
-        nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        hookDestroy = SetWinEventHook(
+            EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
-    if (!hookShow || !hookDestroy || !hookNameChange)
-        Wh_Log(L"SetWinEventHook failed (show=%p destroy=%p namechange=%p)",
-               hookShow, hookDestroy, hookNameChange);
-    else
-        Wh_Log(L"WinEvent hooks registered");
+        hookNameChange = SetWinEventHook(
+            EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE,
+            nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
-    g_safetyTimer = SetTimer(nullptr, 0, 1000, nullptr);
+        if (!hookShow || !hookDestroy || !hookNameChange)
+            Wh_Log(L"SetWinEventHook failed (show=%p destroy=%p namechange=%p)",
+                   hookShow, hookDestroy, hookNameChange);
+        else
+            Wh_Log(L"WinEvent hooks registered");
 
-    MSG msg;
-    while (true) {
-        DWORD r = MsgWaitForMultipleObjects(1, &g_monitorStopEvent, FALSE,
-                                            INFINITE, QS_ALLEVENTS);
-        if (r == WAIT_OBJECT_0) break;
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_TIMER) {
-                if (msg.wParam == g_safetyTimer.load()) {
-                    RefreshWindowSinks();
-                } else if (msg.wParam == g_refreshTimer.load()) {
-                    UINT_PTR id = g_refreshTimer.exchange(0);
-                    if (id) KillTimer(nullptr, id);
-                    RefreshWindowSinks();
+        g_safetyTimer = SetTimer(nullptr, 0, 1000, nullptr);
+
+        MSG msg;
+        while (true) {
+            DWORD r = MsgWaitForMultipleObjects(1, &g_monitorStopEvent, FALSE,
+                                                INFINITE, QS_ALLEVENTS);
+            if (r == WAIT_OBJECT_0) break;
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_TIMER) {
+                    if (msg.wParam == g_safetyTimer.load()) {
+                        RefreshWindowSinks();
+                    } else if (msg.wParam == g_refreshTimer.load()) {
+                        UINT_PTR id = g_refreshTimer.exchange(0);
+                        if (id) KillTimer(nullptr, id);
+                        RefreshWindowSinks();
+                    }
                 }
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
             }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
         }
+    } catch (...) {
+        Wh_Log(L"EventMonitorThread: unhandled exception");
     }
 
+    // Cleanup runs whether the main loop exited normally or an exception
+    // unwound out of the try. Every resource is guarded so partial-init
+    // failure paths don't touch null handles.
     if (UINT_PTR t = g_safetyTimer.exchange(0))  KillTimer(nullptr, t);
     if (UINT_PTR t = g_refreshTimer.exchange(0)) KillTimer(nullptr, t);
     if (hookShow)       UnhookWinEvent(hookShow);
@@ -523,10 +539,7 @@ void EventMonitorThread() {
     g_windowSinks.clear();
     g_windowPaths.clear();
 
-    CoUninitialize();
-  } catch (...) {
-    Wh_Log(L"EventMonitorThread: unhandled exception");
-  }
+    if (coInitialized) CoUninitialize();
 }
 
 // ============================================================================
@@ -534,7 +547,6 @@ void EventMonitorThread() {
 // ============================================================================
 
 void FileWatcherThread() {
-  try {
     // Slot 0 is the stop event; slots 1..MAX_WATCHED_DIRS are watcher handles.
     // Both arrays need MAX_WATCHED_DIRS + 1 slots to actually hold the
     // documented 60 watchers without out-of-bounds writes.
@@ -542,6 +554,7 @@ void FileWatcherThread() {
     std::wstring dirKeys[MAX_WATCHED_DIRS + 1];
     int handleCount = 0;
 
+  try {
     while (WaitForSingleObject(g_watcherStopEvent, 100) == WAIT_TIMEOUT) {
         if (!g_enabled) {
             Sleep(100);
@@ -681,7 +694,13 @@ void FileWatcherThread() {
         }
     }
 
-    // Cleanup on exit.
+  } catch (...) {
+    Wh_Log(L"FileWatcherThread: unhandled exception");
+  }
+
+    // Cleanup runs whether the loop exited normally or an exception unwound
+    // out of the try. Otherwise change-notification handles would leak to
+    // explorer.exe process lifetime.
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         for (auto& [normPath, watcher] : g_watchedDirs) {
@@ -692,9 +711,6 @@ void FileWatcherThread() {
         }
         g_watchedDirs.clear();
     }
-  } catch (...) {
-    Wh_Log(L"FileWatcherThread: unhandled exception");
-  }
 }
 
 // ============================================================================
