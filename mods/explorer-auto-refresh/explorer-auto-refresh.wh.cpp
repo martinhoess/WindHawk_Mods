@@ -379,7 +379,16 @@ static void RefreshWindowSinks() {
         return;
 
     long count = 0;
-    spWindows->get_Count(&count);
+    HRESULT hrCount = spWindows->get_Count(&count);
+    if (FAILED(hrCount)) {
+        // IShellWindows::get_Count can fail during explorer shutdown
+        // (CO_E_SERVER_STOPPED) or in other transient COM-state conditions.
+        // Log and bail — enumerating with a stale count is worse than
+        // skipping one safety-timer tick.
+        Wh_Log(L"IShellWindows::get_Count failed: 0x%08lx", hrCount);
+        spWindows->Release();
+        return;
+    }
 
     std::unordered_set<WindowKey> activeWindows;
 
