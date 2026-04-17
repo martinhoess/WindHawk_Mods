@@ -1791,7 +1791,12 @@ static DWORD  g_threadId   = 0;
 static HANDLE g_thread     = nullptr;
 static HANDLE g_hookReady  = nullptr;  // signalled after SetWindowsHookExW attempt
 static HWND   g_prevFocus  = nullptr;
-static bool   g_inserting  = false;
+// g_inserting is currently only touched on the worker thread (SelectEmoji*,
+// DoInsert, WM_ACTIVATE), but its semantics are "flag observed across the
+// input-insertion sequence" and the review flagged it as cross-thread-shaped.
+// Making it std::atomic is a no-op on the hot path (aligned relaxed load/store)
+// and future-proofs against a refactor that e.g. reads it from the hook proc.
+static std::atomic<bool> g_inserting {false};
 enum class AltShortcut { CtrlPeriod, CtrlSpace, AltPeriod, Disabled };
 
 // Trigger data captured by the hook proc and handed to the UI thread via
