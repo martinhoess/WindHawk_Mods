@@ -6,6 +6,27 @@ A collection of [Windhawk](https://windhawk.net) mods for Windows.
 
 ## Mods
 
+### [Emoji Picker](mods/emoji-picker/)
+
+> Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
+
+**Features**
+- Keyboard-driven picker opened via Win+. (Windows 11 dialog blocked) or a configurable secondary shortcut
+- Real-time search across ~1660 emoji (Unicode 15.0) with German and English keywords
+- Nine category tabs plus a Recent tab that persists across sessions
+- Direct2D / DirectWrite rendering, automatic dark/light theme following system setting
+- Optional hiding of the Flags category for systems that render flags as ISO letters
+
+**Settings**
+
+| Setting | Default | Description |
+|---|---|---|
+| Intercept Win+. | `true` | Block the Windows 11 emoji dialog and open this picker instead |
+| Custom shortcut | `Ctrl+.` | Additional shortcut (`Ctrl+.`, `Ctrl+Space`, `Alt+.`, or disabled) |
+| Hide Flags category | `false` | Hide national flags from picker and tab bar |
+
+---
+
 ### [Explorer Auto Refresh](mods/explorer-auto-refresh/)
 
 > Automatically refreshes Explorer folder views when files change, restoring classic Windows behavior.
