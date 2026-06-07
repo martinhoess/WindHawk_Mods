@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              emoji-picker
 // @name            Emoji Picker
-// @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
-// @version         1.5
+// @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
+// @version         1.6
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -27,6 +27,15 @@
 - hideFlags: false
   $name: Hide Flags category
   $description: "Hide national flags from the picker and tab bar. Useful if your system renders flags as two-letter codes instead of actual flag images."
+- shortcodes: false
+  $name: Inline shortcode expansion
+  $description: "Type :name: anywhere to auto-replace with emoji (e.g. :tada: → 🎉, :feier: → 🎉, :grinning_face: → 😀). Uses English names plus German+English keywords from the picker search. Off by default — enable after testing in your apps."
+- shortcodeDelayMs: 0
+  $name: Shortcode keystroke delay (ms)
+  $description: "Delay between simulated keystrokes during expansion. Increase (e.g. 5-20) if expansion is unreliable in slow apps like RDP, VMs, or Slack."
+- shortcodeDenyList: "cmd.exe;conhost.exe;WindowsTerminal.exe;mstsc.exe;powershell.exe;pwsh.exe"
+  $name: Shortcode denylist
+  $description: "Semicolon-separated list of process names (e.g. cmd.exe). Shortcode expansion is disabled while one of these is the foreground app. Terminals and remote desktop are excluded by default — backspace replay is unreliable there."
 */
 // ==/WindhawkModSettings==
 
@@ -41,6 +50,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <unordered_map>
 
 // ============================================================
 // Emoji data structure — must be defined before emoji-data.h
@@ -1734,6 +1744,7 @@ constexpr UINT WM_HIDE_PICKER   = WM_USER + 3;
 constexpr UINT WM_WARMUP        = WM_USER + 4;
 constexpr UINT WM_LAYOUTS_READY = WM_USER + 5;
 constexpr UINT WM_SYNTH_F23     = WM_USER + 6;  // hand-off so SendInput runs off the hook thread
+constexpr UINT WM_INSERT_SHORTCODE = WM_USER + 7;  // inject :name: → emoji
 constexpr int  IDC_SEARCH       = 1;
 
 static const wchar_t* PICKER_WNDCLASS = L"WindhawkEmojiPicker";
@@ -1821,6 +1832,14 @@ static std::atomic<bool>   g_blockWinDot      {true};   // setting: intercept Wi
 static std::atomic<AltShortcut> g_altShortcut {AltShortcut::CtrlPeriod};  // setting: custom shortcut
 static std::atomic<bool>   g_suppressPeriodUp {false};  // block Period keyup after intercepting Win+.
 static std::atomic<bool>   g_hideFlags        {false};  // setting: hide flags category (declared early; old definition removed below)
+static std::atomic<bool>   g_shortcodesEnabled {false}; // setting: inline :name: expansion
+static std::atomic<int>    g_shortcodeDelayMs {0};      // setting: delay between injected keystrokes (ms)
+// g_shortcodeDenyList: never touched from the hook thread (only checked on the
+// UI thread before WM_INSERT_SHORTCODE runs), so plain std::vector + a mutex
+// taken by ReadSettings is enough.
+static std::vector<std::wstring> g_shortcodeDenyList;
+static CRITICAL_SECTION          g_shortcodeDenyCs;
+static bool                      g_shortcodeDenyCsInit = false;
 static POINT  g_anchorPt         = {};     // caret/cursor pos captured at hook time
 
 static int    g_cat        = 1;
@@ -1832,6 +1851,34 @@ static POINT  g_lastMousePos = {-1,-1}; // detect real vs synthetic WM_MOUSEMOVE
 // g_hideFlags moved into the atomic block above (read by KbHookProc).
 static int    g_hoverRecent  = -1;      // hover index in recent quick-pick row
 
+// Shortcode lookup: keyword -> emoji index in g_emojis. Built once at thread
+// startup from g_emojis[].name (English, lowercase, spaces→'_') plus every
+// pipe-separated token in g_emojis[].kw (DE+EN keywords). First-claim-wins
+// for collisions ("happy" matches dozens of emojis — earliest in the array
+// keeps the keyword, the rest still claim their unique tokens).
+// Read-only after EmojiThread builds it before installing the hook, so no
+// synchronisation needed on lookup.
+static std::unordered_map<std::wstring, int> g_shortcodeMap;
+
+// Typing context for inline shortcode expansion. Touched only on the hook
+// thread (no cross-thread synchronisation needed). The buffer stores the
+// last N printable characters typed into the foreground window; on every
+// ':' we scan backwards for a matching opening ':' and probe the map.
+//
+// Larger buffer = longer keywords supported. 64 is well above the longest
+// keyword in g_emojis (~30 chars) but avoids degrading scan cost.
+constexpr int SHORTCODE_BUF = 64;
+static wchar_t g_scBuf[SHORTCODE_BUF] = {};
+static int     g_scLen = 0;
+static HWND    g_scLastFg = nullptr;   // foreground window during last char
+// PostMessage payload for WM_INSERT_SHORTCODE. emojiIdx is the index into
+// g_emojis whose ch is to be inserted; eraseChars is the number of typed
+// characters (the entire ':name:' including both colons) to backspace before
+// injecting the emoji.
+struct ShortcodeTrigger {
+    int emojiIdx;
+    int eraseChars;
+};
 static std::vector<int>               g_filtered;
 static std::vector<std::wstring>      g_recent;
 static std::vector<IDWriteTextLayout*> g_emojiLayouts;  // pre-created, one per emoji
@@ -1910,6 +1957,121 @@ static void AddToRecent(const wchar_t* ch) {
     g_recent.insert(g_recent.begin(), e);
     if ((int)g_recent.size() > MAX_RECENT) g_recent.resize(MAX_RECENT);
     SaveRecent();
+}
+
+// ============================================================
+// Shortcode index
+// ============================================================
+
+// Returns true if c is a valid character inside a shortcode keyword. We accept
+// ASCII letters/digits/underscore plus all non-ASCII printables (so German
+// umlauts and similar diacritics stay in the key as-is). Control chars,
+// punctuation other than '_', and the pipe/colon delimiters are rejected.
+static bool IsShortcodeChar(wchar_t c) {
+    if (c >= L'a' && c <= L'z') return true;
+    if (c >= L'A' && c <= L'Z') return true;
+    if (c >= L'0' && c <= L'9') return true;
+    if (c == L'_') return true;
+    if (c < 0x80) return false;                 // ASCII punctuation/control
+    if (c == 0x00A0 || c == 0xFEFF) return false; // NBSP, BOM
+    return true;                                // assume non-ASCII letter
+}
+
+// Normalize one keyword in-place: invariant lowercase, spaces → underscore,
+// strip non-shortcode chars. Empty result means the token is unusable.
+static void NormalizeShortcodeToken(std::wstring& s) {
+    // Replace whitespace runs with single underscore, drop other junk
+    std::wstring out;
+    out.reserve(s.size());
+    bool prevUnderscore = false;
+    for (wchar_t c : s) {
+        if (c == L' ' || c == L'\t' || c == 0x00A0) {
+            if (!prevUnderscore && !out.empty()) {
+                out.push_back(L'_');
+                prevUnderscore = true;
+            }
+        } else if (IsShortcodeChar(c)) {
+            out.push_back(c);
+            prevUnderscore = false;
+        }
+        // else: drop
+    }
+    // Trailing underscore from trailing space
+    while (!out.empty() && out.back() == L'_') out.pop_back();
+    s = std::move(out);
+    if (s.empty()) return;
+    // Invariant lowercase
+    int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+        s.c_str(), (int)s.size(), s.data(), (int)s.size(),
+        nullptr, nullptr, 0);
+    if (n > 0) s.resize(n);
+}
+
+// Produce ASCII-fold of a key with German umlauts/ß: ae/oe/ue/ss. Returns
+// empty string if no folding happened (caller skips registration). Using
+// numeric escapes rather than literal characters so the source stays ASCII-
+// safe across mixed-encoding build environments.
+static std::wstring FoldGermanAscii(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size());
+    bool changed = false;
+    for (wchar_t c : s) {
+        switch (c) {
+            case 0x00E4: out += L"ae"; changed = true; break; // ä
+            case 0x00F6: out += L"oe"; changed = true; break; // ö
+            case 0x00FC: out += L"ue"; changed = true; break; // ü
+            case 0x00DF: out += L"ss"; changed = true; break; // ß
+            default: out.push_back(c); break;
+        }
+    }
+    return changed ? out : std::wstring();
+}
+
+static void RegisterShortcode(const std::wstring& key, int idx) {
+    if (key.empty()) return;
+    // First-claim-wins: only insert if not present.
+    g_shortcodeMap.emplace(key, idx);
+}
+
+static void BuildShortcodeMap() {
+    g_shortcodeMap.clear();
+    g_shortcodeMap.reserve(40000);  // empirical upper bound
+
+    for (int i = 0; i < g_emojiCount; i++) {
+        const EmojiEntry& e = g_emojis[i];
+
+        // 1) English official name (always present, ASCII, lowercase already).
+        //    Widen to wchar_t, normalize, register.
+        if (e.name && *e.name) {
+            std::wstring k;
+            k.reserve(strlen(e.name));
+            for (const char* p = e.name; *p; ++p)
+                k.push_back((wchar_t)(unsigned char)*p);
+            NormalizeShortcodeToken(k);
+            RegisterShortcode(k, i);
+        }
+
+        // 2) Pipe-separated keyword list (DE + EN, lowercase already).
+        if (e.kw) {
+            std::wstring tok;
+            for (const wchar_t* p = e.kw; ; ++p) {
+                if (*p == L'|' || *p == L'\0') {
+                    NormalizeShortcodeToken(tok);
+                    if (!tok.empty()) {
+                        RegisterShortcode(tok, i);
+                        std::wstring folded = FoldGermanAscii(tok);
+                        if (!folded.empty())
+                            RegisterShortcode(folded, i);
+                    }
+                    tok.clear();
+                    if (*p == L'\0') break;
+                } else {
+                    tok.push_back(*p);
+                }
+            }
+        }
+    }
+    Wh_Log(L"Shortcode map: %zu keys for %d emoji", g_shortcodeMap.size(), g_emojiCount);
 }
 
 // ============================================================
@@ -2589,6 +2751,123 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DoInsert();
         return 0;
 
+    case WM_INSERT_SHORTCODE: {
+        auto* trig = reinterpret_cast<ShortcodeTrigger*>(lp);
+        if (!trig) return 0;
+        if (trig->emojiIdx < 0 || trig->emojiIdx >= g_emojiCount || trig->eraseChars <= 0) {
+            delete trig;
+            return 0;
+        }
+        const wchar_t* emoji = g_emojis[trig->emojiIdx].ch;
+        int emojiLen = (int)wcslen(emoji);
+        int eraseN = trig->eraseChars;
+        int delay = g_shortcodeDelayMs.load(std::memory_order_relaxed);
+
+        // Block the hook's char tracker from reacting to our own SendInput.
+        // LLKHF_INJECTED filtering in the hook also covers this, but
+        // g_inserting gives belt-and-braces and matches DoInsert semantics.
+        g_inserting = true;
+
+        // Release any modifier keys the user is currently holding (typically
+        // Shift, because ':' on DE/EU layouts is Shift+'.', and the user may
+        // still hold it when the trigger fires). Without this, the
+        // backspaces and Unicode chars below run with Shift-down — most apps
+        // treat Shift+Backspace as "select-and-delete previous word" and
+        // Shift+Unicode-char as nothing at all.
+        struct ModSave { WORD vk; };
+        ModSave saved[6];
+        int savedN = 0;
+        auto trySave = [&](WORD vk) {
+            if (GetAsyncKeyState(vk) & 0x8000) {
+                if (savedN < (int)(sizeof(saved)/sizeof(saved[0])))
+                    saved[savedN++].vk = vk;
+            }
+        };
+        trySave(VK_LSHIFT); trySave(VK_RSHIFT);
+        trySave(VK_LCONTROL); trySave(VK_RCONTROL);
+        trySave(VK_LMENU); trySave(VK_RMENU);
+
+        // Release them
+        if (savedN > 0) {
+            std::vector<INPUT> up(savedN);
+            for (int i = 0; i < savedN; i++) {
+                up[i].type = INPUT_KEYBOARD;
+                up[i].ki = {};
+                up[i].ki.wVk = saved[i].vk;
+                up[i].ki.dwFlags = KEYEVENTF_KEYUP;
+            }
+            SendInput((UINT)savedN, up.data(), sizeof(INPUT));
+            // After the synthetic keyups our own modifier tracking may be
+            // stale (we ignore LLKHF_INJECTED events). Clear the affected
+            // flags so the next Win+. probe sees a clean slate.
+            g_ctrlDown = false;
+            g_altDown  = false;
+        }
+
+        if (delay <= 0) {
+            // Fast path: batch backspaces + unicode emoji into one SendInput.
+            std::vector<INPUT> seq;
+            seq.reserve(eraseN * 2 + emojiLen * 2);
+            for (int i = 0; i < eraseN; i++) {
+                INPUT d{}, u{};
+                d.type = u.type = INPUT_KEYBOARD;
+                d.ki.wVk = u.ki.wVk = VK_BACK;
+                u.ki.dwFlags = KEYEVENTF_KEYUP;
+                seq.push_back(d); seq.push_back(u);
+            }
+            for (int i = 0; i < emojiLen; i++) {
+                INPUT d{}, u{};
+                d.type = u.type = INPUT_KEYBOARD;
+                d.ki.wScan = u.ki.wScan = emoji[i];
+                d.ki.dwFlags = KEYEVENTF_UNICODE;
+                u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+                seq.push_back(d); seq.push_back(u);
+            }
+            SendInput((UINT)seq.size(), seq.data(), sizeof(INPUT));
+        } else {
+            // Slow path: one keystroke at a time with Sleep between. For
+            // RDP/VM/Slack where fast bursts get dropped.
+            auto sendKey = [&](INPUT in) {
+                SendInput(1, &in, sizeof(INPUT));
+                Sleep((DWORD)delay);
+            };
+            for (int i = 0; i < eraseN; i++) {
+                INPUT d{}; d.type = INPUT_KEYBOARD; d.ki.wVk = VK_BACK;
+                sendKey(d);
+                INPUT u = d; u.ki.dwFlags = KEYEVENTF_KEYUP;
+                sendKey(u);
+            }
+            for (int i = 0; i < emojiLen; i++) {
+                INPUT d{}; d.type = INPUT_KEYBOARD;
+                d.ki.wScan = emoji[i]; d.ki.dwFlags = KEYEVENTF_UNICODE;
+                sendKey(d);
+                INPUT u = d; u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+                sendKey(u);
+            }
+        }
+
+        // Restore released modifiers so the user's physical key state
+        // matches what they're holding again.
+        if (savedN > 0) {
+            std::vector<INPUT> down(savedN);
+            for (int i = 0; i < savedN; i++) {
+                down[i].type = INPUT_KEYBOARD;
+                down[i].ki = {};
+                down[i].ki.wVk = saved[i].vk;
+                // no flag = key down
+            }
+            SendInput((UINT)savedN, down.data(), sizeof(INPUT));
+        }
+
+        // Mirror the picker's MRU semantics: count an expanded shortcode
+        // the same as a click on the picker so it shows up in Recent.
+        AddToRecent(emoji);
+
+        g_inserting = false;
+        delete trig;
+        return 0;
+    }
+
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE && !g_inserting)
             ShowWindow(hwnd, SW_HIDE);
@@ -2755,6 +3034,155 @@ static PickerTrigger* CapturePickerTrigger() {
     return t;
 }
 
+// Return the foreground window's executable file name (basename, lowercased)
+// or empty string on failure. Called from the hook thread so kept minimal:
+// QueryFullProcessImageNameW is in kernel32 (no psapi link needed).
+static std::wstring GetForegroundExeName() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return L"";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return L"";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t path[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &sz);
+    CloseHandle(h);
+    if (!ok || sz == 0) return L"";
+    // Find last '\'
+    const wchar_t* base = path;
+    for (DWORD i = 0; i < sz; i++)
+        if (path[i] == L'\\' || path[i] == L'/') base = &path[i + 1];
+    std::wstring name(base);
+    int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+        name.c_str(), (int)name.size(), name.data(), (int)name.size(),
+        nullptr, nullptr, 0);
+    if (n > 0) name.resize(n);
+    return name;
+}
+
+static bool IsShortcodeAppDenied() {
+    if (!g_shortcodeDenyCsInit) return false;
+    std::wstring exe = GetForegroundExeName();
+    if (exe.empty()) return false;
+    bool denied = false;
+    EnterCriticalSection(&g_shortcodeDenyCs);
+    for (const auto& d : g_shortcodeDenyList) {
+        if (d == exe) { denied = true; break; }
+    }
+    LeaveCriticalSection(&g_shortcodeDenyCs);
+    return denied;
+}
+
+// Decode a key event to its text character via ToUnicodeEx with the
+// foreground window's HKL. Returns the number of wchars written to out
+// (0–2; surrogate pairs possible but rare for plain typing).
+// Uses flag (1<<2) — Win10 1607+ "do not change keyboard state" so dead
+// keys are not consumed.
+static int DecodeKeyChar(WORD vk, WORD scanCode, wchar_t out[4]) {
+    BYTE state[256] = {};
+    // Manual modifier read — GetKeyboardState lies cross-process from the LL
+    // hook thread. GetKeyState is reliable for the keys we care about.
+    if (GetKeyState(VK_SHIFT)    & 0x8000) state[VK_SHIFT]    = 0x80;
+    if (GetKeyState(VK_LSHIFT)   & 0x8000) state[VK_LSHIFT]   = 0x80;
+    if (GetKeyState(VK_RSHIFT)   & 0x8000) state[VK_RSHIFT]   = 0x80;
+    if (GetKeyState(VK_CONTROL)  & 0x8000) state[VK_CONTROL]  = 0x80;
+    if (GetKeyState(VK_LCONTROL) & 0x8000) state[VK_LCONTROL] = 0x80;
+    if (GetKeyState(VK_RCONTROL) & 0x8000) state[VK_RCONTROL] = 0x80;
+    if (GetKeyState(VK_MENU)     & 0x8000) state[VK_MENU]     = 0x80;
+    if (GetKeyState(VK_LMENU)    & 0x8000) state[VK_LMENU]    = 0x80;
+    if (GetKeyState(VK_RMENU)    & 0x8000) state[VK_RMENU]    = 0x80;
+    if (GetKeyState(VK_CAPITAL)  & 0x0001) state[VK_CAPITAL]  = 0x01;
+
+    // AltGr filter: Alt held without Ctrl → Ctrl-shortcut, suppress text
+    // output. AltGr (Ctrl+Alt on DE/EU layouts) is allowed through so the
+    // user can still type @, \, etc.
+    if ((state[VK_MENU] & 0x80) && !(state[VK_CONTROL] & 0x80))
+        return 0;
+    // Pure Ctrl-shortcut (Ctrl held, no Alt) → don't track typed control
+    // characters (Ctrl+C would otherwise add 0x03 to the buffer).
+    if ((state[VK_CONTROL] & 0x80) && !(state[VK_MENU] & 0x80))
+        return 0;
+
+    HKL hkl = nullptr;
+    HWND fg = GetForegroundWindow();
+    if (fg) {
+        DWORD tid = GetWindowThreadProcessId(fg, nullptr);
+        if (tid) hkl = GetKeyboardLayout(tid);
+    }
+    int n = ToUnicodeEx(vk, scanCode, state, out, 3, 1 << 2, hkl);
+    if (n < 0) {
+        // Dead key. Flag (1<<2) means the kernel state is untouched, so we
+        // don't need to "unconsume" it like older Windows did. Treat as
+        // "no character yet" — the next normal key will produce the
+        // composed result.
+        return 0;
+    }
+    return n;
+}
+
+// Append decoded chars to the typing buffer. Drops oldest when full.
+static void ScBufAppend(const wchar_t* s, int n) {
+    for (int i = 0; i < n; i++) {
+        if (g_scLen >= SHORTCODE_BUF) {
+            // Shift left by 1 to make room
+            memmove(g_scBuf, g_scBuf + 1, (SHORTCODE_BUF - 1) * sizeof(wchar_t));
+            g_scLen = SHORTCODE_BUF - 1;
+        }
+        g_scBuf[g_scLen++] = s[i];
+    }
+}
+
+static void ScBufClear() {
+    g_scLen = 0;
+}
+
+static void ScBufBackspace() {
+    if (g_scLen > 0) --g_scLen;
+}
+
+// After a ':' was just appended at position g_scLen-1, scan backwards for a
+// previous ':' (within the buffer) and look up the token between them. On
+// match, post WM_INSERT_SHORTCODE and clear the consumed portion of the buf.
+static void ScCheckMatch() {
+    if (g_scLen < 2) return;
+    if (g_scBuf[g_scLen - 1] != L':') return;
+    // Scan back at most SHORTCODE_BUF-1 chars for previous ':'
+    int openAt = -1;
+    int minStart = std::max(0, g_scLen - SHORTCODE_BUF);
+    for (int i = g_scLen - 2; i >= minStart; --i) {
+        if (g_scBuf[i] == L':') { openAt = i; break; }
+        // Anything outside our keyword charset between the colons → not a
+        // shortcode. Bail out fast (avoids hash lookup on e.g. "foo bar:").
+        wchar_t c = g_scBuf[i];
+        if (c == L' ' || c == L'\t' || c == L'\n' || c == L'\r') return;
+    }
+    if (openAt < 0) return;
+    int tokLen = g_scLen - 1 - (openAt + 1);
+    if (tokLen <= 0 || tokLen > 48) return; // empty :: or absurdly long
+    std::wstring key(&g_scBuf[openAt + 1], tokLen);
+    // Lowercase invariant before lookup (map keys are lowercased at build).
+    int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+        key.c_str(), (int)key.size(), key.data(), (int)key.size(),
+        nullptr, nullptr, 0);
+    if (n > 0) key.resize(n);
+    auto it = g_shortcodeMap.find(key);
+    if (it == g_shortcodeMap.end()) return;
+
+    // Match. Compose trigger and post to worker. eraseChars covers the full
+    // ':name:' that was typed (including both colons).
+    int eraseChars = tokLen + 2;
+    auto* trig = new ShortcodeTrigger{ it->second, eraseChars };
+    if (!g_hwnd || !PostMessage(g_hwnd, WM_INSERT_SHORTCODE, 0, (LPARAM)trig)) {
+        delete trig;
+        return;
+    }
+    // Consume the matched range from the buffer so a follow-up ':' doesn't
+    // re-trigger on the same opener.
+    g_scLen = openAt;
+}
+
 static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         auto* k = (KBDLLHOOKSTRUCT*)lp;
@@ -2834,6 +3262,66 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                 }
                 return 1;  // block Ctrl+Space
             }
+
+            // Shortcode buffer tracking. Only runs if none of the picker
+            // shortcut branches above returned. Injected events (from our
+            // own SendInput during expansion) are skipped to avoid feedback
+            // loops.
+            if (g_shortcodesEnabled.load(std::memory_order_relaxed)
+                && !(k->flags & LLKHF_INJECTED)
+                && !g_inserting.load(std::memory_order_relaxed)) {
+
+                HWND curFg = GetForegroundWindow();
+                if (curFg != g_scLastFg) {
+                    g_scLastFg = curFg;
+                    ScBufClear();
+                }
+
+                WORD vk = (WORD)k->vkCode;
+
+                // Modifier keys: don't touch buffer (no char produced).
+                if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+                    vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                    vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+                    vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) {
+                    // pass through
+                } else if (vk == VK_BACK) {
+                    ScBufBackspace();
+                } else if (
+                    vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT ||
+                    vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT ||
+                    vk == VK_INSERT || vk == VK_DELETE ||
+                    vk == VK_RETURN || vk == VK_TAB || vk == VK_ESCAPE) {
+                    // Combo-breakers — typing focus moved or selection
+                    // changed, drop any in-progress shortcode.
+                    ScBufClear();
+                } else {
+                    // Skip if shortcode foreground is in the denylist. This
+                    // call hits OpenProcess + QueryFullProcessImageNameW
+                    // every keystroke; OK on modern Windows (~10 µs) and we
+                    // only do it when shortcodes are enabled.
+                    if (!IsShortcodeAppDenied()) {
+                        wchar_t buf[4] = {};
+                        int n = DecodeKeyChar(vk, (WORD)k->scanCode, buf);
+                        if (n > 0) {
+                            // Drop control chars (tab/newline already handled
+                            // above, but ToUnicodeEx may yield others).
+                            for (int i = 0; i < n; i++) {
+                                if (buf[i] < L' ') { n = 0; break; }
+                            }
+                            if (n > 0) {
+                                ScBufAppend(buf, n);
+                                if (buf[n - 1] == L':') ScCheckMatch();
+                            }
+                        }
+                    } else {
+                        // Denied app — keep buffer cleared so we don't
+                        // resume an expansion when focus returns to an
+                        // allowed app mid-keyword.
+                        ScBufClear();
+                    }
+                }
+            }
         } else if (isUp) {
             if (k->vkCode == VK_LWIN  || k->vkCode == VK_RWIN) {
                 if (!(k->flags & LLKHF_INJECTED)) g_winDown  = false;
@@ -2903,6 +3391,10 @@ static DWORD WINAPI EmojiThread(LPVOID) {
         goto cleanup;
     }
 
+    // Build shortcode keyword → emoji index map before the hook goes live so
+    // there's no race on first keystroke. ~30k entries, ~30 ms on first run.
+    BuildShortcodeMap();
+
     // Install global keyboard hook
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHookProc, nullptr, 0);
     if (!g_kbHook) Wh_Log(L"Failed to install keyboard hook");
@@ -2946,21 +3438,73 @@ cleanup:
 // Windhawk entry points
 // ============================================================
 
+// Split a semicolon-separated list, lowercase each item, trim whitespace. Used
+// to parse the shortcode denylist setting into a vector of process basenames.
+static std::vector<std::wstring> ParseDenyList(LPCWSTR s) {
+    std::vector<std::wstring> out;
+    if (!s) return out;
+    std::wstring cur;
+    for (const wchar_t* p = s; ; ++p) {
+        if (*p == L';' || *p == L'\0') {
+            // Trim spaces
+            size_t a = 0, b = cur.size();
+            while (a < b && (cur[a] == L' ' || cur[a] == L'\t')) ++a;
+            while (b > a && (cur[b-1] == L' ' || cur[b-1] == L'\t')) --b;
+            if (b > a) {
+                std::wstring item(cur, a, b - a);
+                // Invariant lowercase — matches what GetForegroundExeName produces.
+                int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+                    item.c_str(), (int)item.size(),
+                    item.data(), (int)item.size(),
+                    nullptr, nullptr, 0);
+                if (n > 0) item.resize(n);
+                out.push_back(std::move(item));
+            }
+            cur.clear();
+            if (*p == L'\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+    return out;
+}
+
 static void ReadSettings() {
     g_blockWinDot = Wh_GetIntSetting(L"blockWinDot") != 0;
     g_hideFlags   = Wh_GetIntSetting(L"hideFlags") != 0;
+    g_shortcodesEnabled = Wh_GetIntSetting(L"shortcodes") != 0;
+    int d = Wh_GetIntSetting(L"shortcodeDelayMs");
+    if (d < 0) d = 0;
+    if (d > 200) d = 200;  // clamp; longer = unusable
+    g_shortcodeDelayMs = d;
     LPCWSTR s = Wh_GetStringSetting(L"shortcut");
     if      (wcscmp(s, L"ctrl_space") == 0) g_altShortcut = AltShortcut::CtrlSpace;
     else if (wcscmp(s, L"alt_period") == 0) g_altShortcut = AltShortcut::AltPeriod;
     else if (wcscmp(s, L"disabled")   == 0) g_altShortcut = AltShortcut::Disabled;
     else                                     g_altShortcut = AltShortcut::CtrlPeriod;
     Wh_FreeStringSetting(s);
-    Wh_Log(L"Settings: blockWinDot=%d shortcut=%d hideFlags=%d",
-        (int)g_blockWinDot.load(), (int)g_altShortcut.load(), (int)g_hideFlags.load());
+
+    LPCWSTR deny = Wh_GetStringSetting(L"shortcodeDenyList");
+    auto parsed = ParseDenyList(deny);
+    Wh_FreeStringSetting(deny);
+    if (g_shortcodeDenyCsInit) {
+        EnterCriticalSection(&g_shortcodeDenyCs);
+        g_shortcodeDenyList = std::move(parsed);
+        LeaveCriticalSection(&g_shortcodeDenyCs);
+    } else {
+        g_shortcodeDenyList = std::move(parsed);
+    }
+
+    Wh_Log(L"Settings: blockWinDot=%d shortcut=%d hideFlags=%d shortcodes=%d delay=%d denyN=%zu",
+        (int)g_blockWinDot.load(), (int)g_altShortcut.load(), (int)g_hideFlags.load(),
+        (int)g_shortcodesEnabled.load(), (int)g_shortcodeDelayMs.load(),
+        g_shortcodeDenyList.size());
 }
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Emoji Picker: init");
+    InitializeCriticalSection(&g_shortcodeDenyCs);
+    g_shortcodeDenyCsInit = true;
     ReadSettings();
     // Manual-reset event so we can wait across thread startup without timing
     // the worker thread against the hook install.
@@ -3023,5 +3567,9 @@ void Wh_ModUninit() {
             CloseHandle(g_thread);
         }
         g_thread = nullptr;
+    }
+    if (g_shortcodeDenyCsInit) {
+        DeleteCriticalSection(&g_shortcodeDenyCs);
+        g_shortcodeDenyCsInit = false;
     }
 }
