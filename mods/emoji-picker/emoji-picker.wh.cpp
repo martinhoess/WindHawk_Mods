@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, and recent emoji.
-// @version         1.4
+// @version         1.5
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -2434,8 +2434,25 @@ static void ShowPickerAt(PickerTrigger* trigger) {
         g_altDown  = false;
     }
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, physW, physH, SWP_SHOWWINDOW);
+
+    // SetForegroundWindow refuses to move focus when our process isn't in the
+    // user-input context (we're running from a PostMessage handler, not the
+    // hook proc itself). On second invocation it works because the picker
+    // still owns a recent input timestamp from when it was last dismissed —
+    // but after a fresh boot that timestamp doesn't exist yet, so the first
+    // open shows the window without focus. Bypass the foreground lock by
+    // briefly attaching to the foreground thread's input queue.
+    HWND  fg     = GetForegroundWindow();
+    DWORD fgTid  = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    DWORD ourTid = GetCurrentThreadId();
+    bool  attached = false;
+    if (fgTid && fgTid != ourTid)
+        attached = AttachThreadInput(fgTid, ourTid, TRUE);
+    BringWindowToTop(g_hwnd);
     SetForegroundWindow(g_hwnd);
     SetFocus(g_searchEdit);
+    if (attached)
+        AttachThreadInput(fgTid, ourTid, FALSE);
 }
 
 // ============================================================
