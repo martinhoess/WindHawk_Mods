@@ -2,13 +2,13 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
-// @version         1.7
+// @version         1.8
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -ld2d1 -ldwrite -luser32 -lgdi32 -ldwmapi -luuid -lole32
+// @compilerOptions -ld2d1 -ldwrite -luser32 -lgdi32 -ldwmapi -luuid -lole32 -lshell32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
@@ -36,6 +36,9 @@
 - shortcodeDenyList: "cmd.exe;conhost.exe;WindowsTerminal.exe;mstsc.exe;powershell.exe;pwsh.exe"
   $name: Shortcode denylist
   $description: "Semicolon-separated list of process names (e.g. cmd.exe). Shortcode expansion is disabled while one of these is the foreground app. Terminals and remote desktop are excluded by default — backspace replay is unreliable there."
+- logUsage: false
+  $name: Log emoji selections
+  $description: "Append each picked or expanded emoji to a TSV file under %LOCALAPPDATA%\\WindhawkMods\\EmojiPicker\\stats.tsv. Useful for deriving your personal top-10 over time, then hand-curating the shortcut/weight fields. Off by default."
 */
 // ==/WindhawkModSettings==
 
@@ -51,6 +54,7 @@
 #include <cctype>
 #include <cstring>
 #include <unordered_map>
+#include <shlobj.h>
 
 // ============================================================
 // Emoji data structure — must be defined before emoji-data.h
@@ -61,10 +65,19 @@ struct EmojiEntry {
     const char*    name;  // English name (lowercase) for search
     const wchar_t* kw;    // pipe-separated keywords (DE+EN), or nullptr
     int            cat;   // category 1-9
+    // Optional: pipe-separated short shortcode aliases. Used as additional
+    // map keys at higher priority than auto-derived keywords. Examples:
+    // L"lol|joy" for face-with-tears-of-joy.
+    const wchar_t* shortcut = nullptr;
+    // Optional: priority for shortcode collision resolution. Higher weight
+    // overrides earlier first-claim entries when two emojis claim the same
+    // keyword. 0 = default (uncurated). 10+ = curated top emoji.
+    int            weight   = 0;
 };
 
 // AUTO-GENERATED from unicode.org emoji-test.txt (emoji 15.0)
-// DO NOT EDIT MANUALLY
+// DO NOT EDIT MANUALLY — except for the `shortcut` and `weight` fields on
+// individual entries, which are hand-curated and must survive regenerations.
 
 static const EmojiEntry g_emojis[] = {
     {L"\xD83D\xDE00", "grinning face", L"gesicht|grinsendes gesicht|lol|lustig|grinning face|smile|happy|joy|:d|grin|smiley", 1},
@@ -74,7 +87,7 @@ static const EmojiEntry g_emojis[] = {
     {L"\xD83D\xDE06", "grinning squinting face", L"geschlossene augen|gesicht|grinsegesicht mit zugekniffenen augen|grinsendes gesicht mit zusammengekniffenen augen|offener mund|grinning squinting face|happy|joy|lol|satisfied|haha|glad|xd|laugh|big", 1},
     {L"\xD83D\xDE05", "grinning face with sweat", L"gesicht|grinsendes gesicht mit schwei\u00DFtropfen|lustig|schwei\u00DF|schwitzen|grinning face with sweat|hot|happy|laugh|sweat|smile|relief|cold|exercise|mouth|open|smiling", 1},
     {L"\xD83E\xDD23", "rolling on the floor laughing", L"gesicht|lachen|sich vor lachen auf dem boden w\u00E4lzen|rolling on the floor laughing|rolling|floor|laughing|lol|haha|rofl|laugh|rotfl", 1},
-    {L"\xD83D\xDE02", "face with tears of joy", L"gesicht|gesicht mit freudentr\u00E4nen|lachen|tr\u00E4nen|face with tears of joy|cry|tears|weep|happy|happytears|haha|crying|laugh|laughing|lol|tear", 1},
+    {L"\xD83D\xDE02", "face with tears of joy", L"gesicht|gesicht mit freudentr\u00E4nen|lachen|tr\u00E4nen|face with tears of joy|cry|tears|weep|happy|happytears|haha|crying|laugh|laughing|lol|tear", 1, L"lol|joy|lachen", 10},
     {L"\xD83D\xDE42", "slightly smiling face", L"gesicht|l\u00E4cheln|l\u00E4chelnd|leicht l\u00E4chelndes gesicht|slightly smiling face|smile|fine|happy|this", 1},
     {L"\xD83D\xDE43", "upside-down face", L"auf dem kopf stehen|gesicht|umgekehrtes gesicht|upside down face|flipped|silly|smile|sarcasm", 1},
     {L"\xD83E\xDEE0", "melting face", L"aufl\u00F6sen|fl\u00FCssig|gesicht|schmelzen|schmelzendes gesicht|verschwinden|melting face|hot|heat|disappear|dissolve|dread|liquid|melt|sarcasm", 1},
@@ -1838,6 +1851,7 @@ static std::atomic<bool>   g_suppressPeriodUp {false};  // block Period keyup af
 static std::atomic<bool>   g_hideFlags        {false};  // setting: hide flags category (declared early; old definition removed below)
 static std::atomic<bool>   g_shortcodesEnabled {false}; // setting: inline :name: expansion
 static std::atomic<int>    g_shortcodeDelayMs {0};      // setting: delay between injected keystrokes (ms)
+static std::atomic<bool>   g_logUsage          {false}; // setting: append picks to stats.tsv
 // g_shortcodeDenyList: never touched from the hook thread (only checked on the
 // UI thread before WM_INSERT_SHORTCODE runs), so plain std::vector + a mutex
 // taken by ReadSettings is enough.
@@ -1855,14 +1869,19 @@ static POINT  g_lastMousePos = {-1,-1}; // detect real vs synthetic WM_MOUSEMOVE
 // g_hideFlags moved into the atomic block above (read by KbHookProc).
 static int    g_hoverRecent  = -1;      // hover index in recent quick-pick row
 
-// Shortcode lookup: keyword -> emoji index in g_emojis. Built once at thread
-// startup from g_emojis[].name (English, lowercase, spaces→'_') plus every
-// pipe-separated token in g_emojis[].kw (DE+EN keywords). First-claim-wins
-// for collisions ("happy" matches dozens of emojis — earliest in the array
-// keeps the keyword, the rest still claim their unique tokens).
+// Shortcode lookup: keyword -> {emoji index, weight}. Built once at thread
+// startup from g_emojis[].name (English, lowercase, spaces→'_'), every
+// pipe-separated token in g_emojis[].kw (DE+EN keywords), and any
+// hand-curated tokens in g_emojis[].shortcut.
+//
+// Collision policy: higher weight wins. Same weight → first-claim-wins (the
+// earlier entry in g_emojis keeps the keyword). Curated entries get
+// weight 10+, so :lol: always resolves to 😂 regardless of array order.
+//
 // Read-only after EmojiThread builds it before installing the hook, so no
 // synchronisation needed on lookup.
-static std::unordered_map<std::wstring, int> g_shortcodeMap;
+struct ScVal { int idx; int weight; };
+static std::unordered_map<std::wstring, ScVal> g_shortcodeMap;
 
 // Typing context for inline shortcode expansion. Touched only on the hook
 // thread (no cross-thread synchronisation needed). The buffer stores the
@@ -1880,8 +1899,9 @@ static HWND    g_scLastFg = nullptr;   // foreground window during last char
 // characters (the entire ':name:' including both colons) to backspace before
 // injecting the emoji.
 struct ShortcodeTrigger {
-    int emojiIdx;
-    int eraseChars;
+    int          emojiIdx;
+    int          eraseChars;
+    std::wstring keyword;  // the text between the colons (for usage logging)
 };
 static std::vector<int>               g_filtered;
 static std::vector<std::wstring>      g_recent;
@@ -1965,6 +1985,77 @@ static void AddToRecent(const wchar_t* ch) {
 }
 
 // ============================================================
+// Usage logging — opt-in, appends to stats.tsv under LocalAppData
+// ============================================================
+
+// Append a tab-separated record of an emoji selection so the user can
+// derive their personal top-N over time (and hand-curate the shortcut +
+// weight fields based on real data).
+//
+// Columns:
+//   timestamp   ISO 8601 local time (YYYY-MM-DDTHH:MM:SS)
+//   emoji       UTF-8 encoded emoji character
+//   source      "picker" | "recent" | "shortcode"
+//   context     query typed (picker), keyword (shortcode), or empty
+//
+// File: %LOCALAPPDATA%\WindhawkMods\EmojiPicker\stats.tsv
+// Format chosen so it opens in Excel/LibreOffice and parses cleanly in
+// Python (just `csv.reader(open(p, encoding='utf-8'), delimiter='\t')`).
+static void LogEmojiUsage(const wchar_t* emoji, const wchar_t* source,
+                          const wchar_t* context) {
+    if (!g_logUsage.load(std::memory_order_relaxed)) return;
+    if (!emoji || !*emoji || !source) return;
+
+    wchar_t baseDir[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, baseDir)))
+        return;
+
+    wchar_t dir[MAX_PATH];
+    swprintf(dir, MAX_PATH, L"%s\\WindhawkMods\\EmojiPicker", baseDir);
+    // CreateDirectory creates only the last component; do parents manually.
+    wchar_t parent[MAX_PATH];
+    swprintf(parent, MAX_PATH, L"%s\\WindhawkMods", baseDir);
+    CreateDirectoryW(parent, nullptr);
+    CreateDirectoryW(dir, nullptr);
+
+    wchar_t path[MAX_PATH];
+    swprintf(path, MAX_PATH, L"%s\\stats.tsv", dir);
+
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    LARGE_INTEGER size = {};
+    GetFileSizeEx(h, &size);
+    if (size.QuadPart == 0) {
+        // Write UTF-8 BOM + header so Excel auto-detects encoding.
+        const char* hdr = "\xEF\xBB\xBFtimestamp\temoji\tsource\tcontext\n";
+        DWORD wr = 0;
+        WriteFile(h, hdr, (DWORD)strlen(hdr), &wr, nullptr);
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t lineW[512];
+    int n = swprintf(lineW, 512,
+        L"%04u-%02u-%02uT%02u:%02u:%02u\t%s\t%s\t%s\n",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond,
+        emoji, source, context ? context : L"");
+    if (n <= 0) { CloseHandle(h); return; }
+
+    // Convert to UTF-8 for portability.
+    int u8size = WideCharToMultiByte(CP_UTF8, 0, lineW, n, nullptr, 0, nullptr, nullptr);
+    if (u8size > 0) {
+        std::vector<char> u8(u8size);
+        WideCharToMultiByte(CP_UTF8, 0, lineW, n, u8.data(), u8size, nullptr, nullptr);
+        DWORD wr = 0;
+        WriteFile(h, u8.data(), (DWORD)u8size, &wr, nullptr);
+    }
+    CloseHandle(h);
+}
+
+// ============================================================
 // Shortcode index
 // ============================================================
 
@@ -2032,10 +2123,18 @@ static std::wstring FoldGermanAscii(const std::wstring& s) {
     return changed ? out : std::wstring();
 }
 
-static void RegisterShortcode(const std::wstring& key, int idx) {
+// Insert or upgrade a shortcode key. Higher weight always wins; ties go to
+// first-claim (so the earlier entry in g_emojis keeps the keyword when no
+// curation distinguishes them).
+static void RegisterShortcode(const std::wstring& key, int idx, int weight) {
     if (key.empty()) return;
-    // First-claim-wins: only insert if not present.
-    g_shortcodeMap.emplace(key, idx);
+    auto it = g_shortcodeMap.find(key);
+    if (it == g_shortcodeMap.end()) {
+        g_shortcodeMap.emplace(key, ScVal{idx, weight});
+    } else if (weight > it->second.weight) {
+        it->second = {idx, weight};
+    }
+    // else: same or lower weight → existing entry keeps the key.
 }
 
 static void BuildShortcodeMap() {
@@ -2044,6 +2143,7 @@ static void BuildShortcodeMap() {
 
     for (int i = 0; i < g_emojiCount; i++) {
         const EmojiEntry& e = g_emojis[i];
+        int w = e.weight;
 
         // 1) English official name (always present, ASCII, lowercase already).
         //    Widen to wchar_t, normalize, register.
@@ -2053,7 +2153,7 @@ static void BuildShortcodeMap() {
             for (const char* p = e.name; *p; ++p)
                 k.push_back((wchar_t)(unsigned char)*p);
             NormalizeShortcodeToken(k);
-            RegisterShortcode(k, i);
+            RegisterShortcode(k, i, w);
         }
 
         // 2) Pipe-separated keyword list (DE + EN, lowercase already).
@@ -2063,10 +2163,32 @@ static void BuildShortcodeMap() {
                 if (*p == L'|' || *p == L'\0') {
                     NormalizeShortcodeToken(tok);
                     if (!tok.empty()) {
-                        RegisterShortcode(tok, i);
+                        RegisterShortcode(tok, i, w);
                         std::wstring folded = FoldGermanAscii(tok);
                         if (!folded.empty())
-                            RegisterShortcode(folded, i);
+                            RegisterShortcode(folded, i, w);
+                    }
+                    tok.clear();
+                    if (*p == L'\0') break;
+                } else {
+                    tok.push_back(*p);
+                }
+            }
+        }
+
+        // 3) Hand-curated short aliases. Same weight as the entry — when
+        //    two curated entries collide on a token (rare), first-claim
+        //    still applies, so the earlier-listed curation wins.
+        if (e.shortcut) {
+            std::wstring tok;
+            for (const wchar_t* p = e.shortcut; ; ++p) {
+                if (*p == L'|' || *p == L'\0') {
+                    NormalizeShortcodeToken(tok);
+                    if (!tok.empty()) {
+                        RegisterShortcode(tok, i, w);
+                        std::wstring folded = FoldGermanAscii(tok);
+                        if (!folded.empty())
+                            RegisterShortcode(folded, i, w);
                     }
                     tok.clear();
                     if (*p == L'\0') break;
@@ -2525,6 +2647,10 @@ static void SelectEmoji(int filteredIdx) {
     const wchar_t* ch = g_emojis[g_filtered[filteredIdx]].ch;
 
     AddToRecent(ch);
+    // Source = "picker" if the user typed a query, "category" if they just
+    // scrolled the grid by category. Helps distinguish "I knew what I
+    // wanted" from "I was browsing".
+    LogEmojiUsage(ch, g_query[0] ? L"picker" : L"category", g_query);
     g_pending = ch;
     g_inserting = true;
 
@@ -2547,6 +2673,7 @@ static void SelectEmoji(int filteredIdx) {
 // safe regardless of what the function body does.
 static void SelectEmojiCh(std::wstring ch) {
     AddToRecent(ch.c_str());
+    LogEmojiUsage(ch.c_str(), L"recent", L"");
     g_pending   = ch;
     g_inserting = true;
     ShowWindow(g_hwnd, SW_HIDE);
@@ -2936,6 +3063,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Mirror the picker's MRU semantics: count an expanded shortcode
         // the same as a click on the picker so it shows up in Recent.
         AddToRecent(emoji);
+        LogEmojiUsage(emoji, L"shortcode", trig->keyword.c_str());
 
         g_inserting = false;
         delete trig;
@@ -3247,7 +3375,7 @@ static void ScCheckMatch() {
     // Match. Compose trigger and post to worker. eraseChars covers the full
     // ':name:' that was typed (including both colons).
     int eraseChars = tokLen + 2;
-    auto* trig = new ShortcodeTrigger{ it->second, eraseChars };
+    auto* trig = new ShortcodeTrigger{ it->second.idx, eraseChars, key };
     if (!g_hwnd || !PostMessage(g_hwnd, WM_INSERT_SHORTCODE, 0, (LPARAM)trig)) {
         delete trig;
         return;
@@ -3548,6 +3676,7 @@ static void ReadSettings() {
     g_blockWinDot = Wh_GetIntSetting(L"blockWinDot") != 0;
     g_hideFlags   = Wh_GetIntSetting(L"hideFlags") != 0;
     g_shortcodesEnabled = Wh_GetIntSetting(L"shortcodes") != 0;
+    g_logUsage          = Wh_GetIntSetting(L"logUsage")   != 0;
     int d = Wh_GetIntSetting(L"shortcodeDelayMs");
     if (d < 0) d = 0;
     if (d > 200) d = 200;  // clamp; longer = unusable
