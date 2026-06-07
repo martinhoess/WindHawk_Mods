@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
-// @version         1.6
+// @version         1.7
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -1729,12 +1729,16 @@ constexpr int CELL     = 42;
 constexpr int COLS     = 9;
 constexpr int SEARCH_H = 48;
 constexpr int RECENT_H = CELL;   // 42 — quick-pick row below search
+constexpr int HINT_H   = 22;     // shortcode hint row between grid and tabs
 constexpr int TAB_H    = 52;
 constexpr int GRID_PAD = (WIN_W - COLS * CELL) / 2;  // 21px each side
 constexpr int GRID_TOP = SEARCH_H + RECENT_H + 1;    // below recent row + separator
-constexpr int WIN_H    = 521;    // 48 + 42 + 1 + 378 + 52
-constexpr int GRID_BOT = WIN_H - TAB_H;
-constexpr int GRID_H   = GRID_BOT - GRID_TOP;         // 378 = 9*CELL
+constexpr int GRID_H   = 9 * CELL;                    // 378 = 9 rows
+constexpr int GRID_BOT = GRID_TOP + GRID_H;          // bottom edge of emoji grid
+constexpr int HINT_TOP = GRID_BOT;
+constexpr int HINT_BOT = HINT_TOP + HINT_H;
+constexpr int TAB_TOP  = HINT_BOT;
+constexpr int WIN_H    = TAB_TOP + TAB_H;            // 48+42+1+378+22+52 = 543
 constexpr int NUM_CATS = 10;                           // 0=Recent, 1-9=emoji
 constexpr int MAX_RECENT = 45;
 
@@ -1893,6 +1897,7 @@ static IDWriteFactory*        g_dwFact   = nullptr;
 static ID2D1HwndRenderTarget* g_rt       = nullptr;
 static IDWriteTextFormat*     g_emojiFmt = nullptr;
 static IDWriteTextFormat*     g_tabFmt   = nullptr;
+static IDWriteTextFormat*     g_hintFmt  = nullptr;
 static ID2D1SolidColorBrush*  g_brText   = nullptr;
 static ID2D1SolidColorBrush*  g_brHover  = nullptr;
 static ID2D1SolidColorBrush*  g_brTabBg  = nullptr;
@@ -2289,6 +2294,53 @@ static HRESULT CreateDeviceResources(HWND hwnd) {
 // Rendering
 // ============================================================
 
+// Compose the :shortcode: form of an emoji's English name. Derives from
+// g_emojis[idx].name (already lowercase) with spaces → underscores. This is
+// the SAME normalization used at map-build time, so the displayed hint is
+// always a valid trigger.
+static std::wstring EmojiPrimaryShortcode(int idx) {
+    if (idx < 0 || idx >= g_emojiCount) return L"";
+    const char* n = g_emojis[idx].name;
+    if (!n || !*n) return L"";
+    std::wstring s;
+    s.reserve(strlen(n) + 2);
+    s.push_back(L':');
+    for (const char* p = n; *p; ++p)
+        s.push_back(*p == ' ' ? L'_' : (wchar_t)(unsigned char)*p);
+    s.push_back(L':');
+    return s;
+}
+
+// Find which g_emojis entry matches a recent-row UTF-16 sequence by exact
+// character equality. Linear scan — only called on hover (not per frame for
+// the grid).
+static int RecentEmojiToIndex(const std::wstring& ch) {
+    for (int i = 0; i < g_emojiCount; i++) {
+        if (ch == g_emojis[i].ch) return i;
+    }
+    return -1;
+}
+
+static std::wstring ComposeHintText() {
+    int idx = -1;
+    if (g_hoverIdx >= 0 && g_hoverIdx < (int)g_filtered.size()) {
+        idx = g_filtered[g_hoverIdx];
+    } else if (g_hoverRecent >= 0 && g_hoverRecent < (int)g_recent.size()) {
+        idx = RecentEmojiToIndex(g_recent[g_hoverRecent]);
+    }
+    bool enabled = g_shortcodesEnabled.load(std::memory_order_relaxed);
+    if (idx >= 0) {
+        std::wstring code = EmojiPrimaryShortcode(idx);
+        std::wstring hint = std::wstring(g_emojis[idx].ch) + L"  " + code;
+        if (!enabled) hint += L"   (shortcodes off)";
+        return hint;
+    }
+    // No hover — generic tip.
+    return enabled
+        ? std::wstring(L"Hover an emoji to see its :shortcode:")
+        : std::wstring(L"Tip: enable \"Inline shortcode expansion\" in mod settings");
+}
+
 static void RenderFrame() {
     if (!g_rt) return;
     if (FAILED(CreateDeviceResources(g_hwnd))) return;
@@ -2360,15 +2412,27 @@ static void RenderFrame() {
     done_grid:
     g_rt->PopAxisAlignedClip();
 
+    // --- Hint band (shortcode preview) ---
+    g_rt->FillRectangle(D2D1::RectF(0, HINT_TOP, WIN_W, HINT_BOT), g_brTabBg);
+    g_rt->FillRectangle(D2D1::RectF(0, HINT_TOP, WIN_W, HINT_TOP+1), g_brSep);
+    {
+        std::wstring hint = ComposeHintText();
+        if (!hint.empty() && g_hintFmt) {
+            g_rt->DrawText(hint.c_str(), (UINT32)hint.size(), g_hintFmt,
+                D2D1::RectF(8, (float)HINT_TOP, (float)(WIN_W - 8), (float)HINT_BOT),
+                g_brText, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        }
+    }
+
     // --- Tab bar ---
     int visibleTabs = g_hideFlags ? NUM_CATS - 1 : NUM_CATS;
     float tabW = (float)WIN_W / visibleTabs;
-    g_rt->FillRectangle(D2D1::RectF(0, GRID_BOT, WIN_W, WIN_H), g_brTabBg);
-    g_rt->FillRectangle(D2D1::RectF(0, GRID_BOT, WIN_W, GRID_BOT+1), g_brSep);
+    g_rt->FillRectangle(D2D1::RectF(0, TAB_TOP, WIN_W, WIN_H), g_brTabBg);
+    g_rt->FillRectangle(D2D1::RectF(0, TAB_TOP, WIN_W, TAB_TOP+1), g_brSep);
 
     for (int i = 0; i < NUM_CATS; i++) {
         if (i == 9 && g_hideFlags) continue;
-        float tx = i * tabW, ty = (float)GRID_BOT;
+        float tx = i * tabW, ty = (float)TAB_TOP;
         if (i == g_hoverTab)
             g_rt->FillRectangle(D2D1::RectF(tx, ty, tx+tabW, WIN_H), g_brHover);
         if (i == g_cat)
@@ -2405,7 +2469,7 @@ static int GridHit(int mxPhys, int myPhys) {
 static int TabHit(int mxPhys, int myPhys) {
     int mx = MulDiv(mxPhys, 96, (int)g_dpi);
     int my = MulDiv(myPhys, 96, (int)g_dpi);
-    if (my < GRID_BOT || my >= WIN_H) return -1;
+    if (my < TAB_TOP || my >= WIN_H) return -1;
     int visibleTabs = g_hideFlags ? NUM_CATS - 1 : NUM_CATS;
     int t = (int)((float)mx / (float)WIN_W * visibleTabs);
     if (t < 0 || t >= visibleTabs) return -1;
@@ -2709,6 +2773,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_tabFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 g_tabFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             }
+            // Hint band — shows :shortcode: preview for hovered emoji.
+            // Slightly smaller, regular UI font, vertically centered.
+            g_dwFact->CreateTextFormat(L"Segoe UI", nullptr,
+                DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &g_hintFmt);
+            if (g_hintFmt) {
+                g_hintFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                g_hintFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            }
         }
 
         // Windows 11 rounded corners
@@ -2732,6 +2805,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_emojiLayouts.clear();
         SafeRelease(&g_emojiFmt);
         SafeRelease(&g_tabFmt);
+        SafeRelease(&g_hintFmt);
         DiscardDeviceResources();
         // Clear the global BEFORE the handle becomes recyclable, and post
         // WM_QUIT so the worker thread's GetMessage loop exits even if we
@@ -3425,6 +3499,7 @@ cleanup:
     g_emojiLayouts.clear();
     SafeRelease(&g_emojiFmt);
     SafeRelease(&g_tabFmt);
+    SafeRelease(&g_hintFmt);
     DiscardDeviceResources();
     SafeRelease(&g_dwFact);
     SafeRelease(&g_d2dFact);
