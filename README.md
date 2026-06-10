@@ -56,6 +56,29 @@ Windows Explorer used to automatically refresh its file listing when files chang
 
 ---
 
+### [Right-Click Ring](mods/right-click-ring/)
+
+> Hold the right mouse button to open a Logitech Actions Ring–style radial menu at the cursor. Release over a bubble to run its action; the center hub falls through to the app's own context menu. A quick right-click still shows the normal menu.
+
+**Features**
+- Global `WH_MOUSE_LL` hook with a hold-to-open trigger; quick click passes through as a normal right-click
+- Logitech-style floating icon bubbles (Segoe Fluent Icons) rendered with Direct2D, per-monitor DPI aware
+- Eight actions — clipboard/edit hotkeys, app launch, native menu — plus a center hub that names the hovered slice and falls through to the app's own context menu
+- Move-guard hands a right-drag back to the app instead of opening the ring
+- Per-app denylist to keep right-click fully native in games, remote desktop, etc.
+
+**Settings**
+
+| Setting | Default | Description |
+|---|---|---|
+| Enabled | `true` | Master switch without uninstalling |
+| Hold threshold (ms) | `250` | How long to hold before the ring opens; also the max delay added to a normal right-click |
+| App denylist | *(empty)* | Semicolon-separated process names where the ring is disabled |
+
+See the [mod README](mods/right-click-ring/) for the roadmap (user-configurable slices, sub-bubbles, native-items-in-ring).
+
+---
+
 ## License
 
 [WTFPL](LICENSE) — Do What The Fuck You Want To Public License
