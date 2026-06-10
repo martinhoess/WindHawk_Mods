@@ -1,13 +1,13 @@
 // ==WindhawkMod==
 // @id              right-click-ring
 // @name            Right-Click Ring
-// @description     Holding the right mouse button opens a Logitech-style radial overlay at the cursor. The center hub falls through to the app's own context menu; a quick right-click still shows it directly. The 8 outer slices are placeholders (logged only).
-// @version         0.2
+// @description     Holding the right mouse button opens a Logitech-style radial overlay at the cursor. The 8 slices show icons and run actions (clipboard/edit hotkeys, app launch, native menu); the center hub names the hovered slice and falls through to the app's own context menu. A quick right-click still shows it directly.
+// @version         0.4
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -ld2d1 -ldwrite -lgdi32 -luser32 -lole32 -lshcore
+// @compilerOptions -ld2d1 -ldwrite -lgdi32 -luser32 -lole32 -lshcore -lshell32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
@@ -28,11 +28,13 @@
 // per-pixel alpha (black/white, Logitech-ish), hover tracking follows the
 // mouse, and a release reports which slice was chosen (via Wh_Log).
 //
-// The 8 outer slice labels are placeholders (selection is logged only). The
-// center "Win" hub now falls through: releasing on it re-issues a real
-// right-click at the original spot so the app shows its own context menu.
-// The ONE behaviour change you'll feel: every right-click system-wide now
-// waits up to `holdMs` (hold = ring, tap = native menu).
+// The 8 outer slices now dispatch real actions (see g_slices): clipboard/edit
+// hotkeys, an app launch, and a native-menu fall-through. The center "Win" hub
+// re-issues a real right-click at the original spot so the app shows its own
+// context menu. The slice set is a hard-coded placeholder for now — it becomes
+// user-configurable in a later milestone. The ONE behaviour change you'll
+// feel: every right-click system-wide now waits up to `holdMs` (hold = ring,
+// tap = native menu).
 //
 // Architecture mirrors the emoji-picker mod: a single worker thread owns the
 // D2D resources, the overlay window, the WH_MOUSE_LL hook, and a message loop.
@@ -42,6 +44,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <shellscalingapi.h>
@@ -54,12 +57,18 @@
 
 static const wchar_t* RING_WNDCLASS = L"WhRightClickRing";
 
-constexpr float  RING_DIAM_DIP = 320.0f;  // outer diameter, device-independent px
-constexpr float  HUB_RADIUS_DIP = 46.0f;  // central "Win" hub radius
+constexpr float  RING_DIAM_DIP   = 320.0f; // overlay diameter, device-independent px
+constexpr float  HUB_RADIUS_DIP  = 36.0f;  // central hub radius
+constexpr float  BUBBLE_R_DIP    = 30.0f;  // each action bubble radius
+constexpr float  BUBBLE_RING_DIP = 104.0f; // distance center -> bubble center
 constexpr int    SEG_COUNT = 8;
 constexpr float  PI = 3.14159265358979323846f;
 
 constexpr UINT_PTR TIMER_HOLD = 1;
+
+// Posted from the hook to the worker thread to run a selected action off the
+// hook callback. wParam: slice index 0..SEG_COUNT-1, or SEG_COUNT for the hub.
+constexpr UINT WM_RING_ACTION = WM_APP + 1;
 
 // Marks our own synthesized right-clicks so the hook ignores them (no re-entry).
 constexpr ULONG_PTR RING_SENTINEL = 0x52494E47;  // 'RING'
@@ -68,9 +77,37 @@ constexpr ULONG_PTR RING_SENTINEL = 0x52494E47;  // 'RING'
 constexpr int HOVER_NONE = -1;
 constexpr int HOVER_HUB  = -2;
 
-// Placeholder slice labels — purely cosmetic for this milestone.
-static const wchar_t* g_labels[SEG_COUNT] = {
-    L"Copy", L"Paste", L"Cut", L"Undo", L"Redo", L"Search", L"New", L"More",
+// Action a slice (or the hub) performs when selected.
+enum ActType { AT_HOTKEY, AT_LAUNCH, AT_NATIVE };
+
+// Modifier bitmask for AT_HOTKEY. Custom RMOD_* names avoid clashing with the
+// MOD_* macros from WinUser.h (RegisterHotKey).
+constexpr WORD RMOD_CTRL  = 0x01;
+constexpr WORD RMOD_ALT   = 0x02;
+constexpr WORD RMOD_SHIFT = 0x04;
+constexpr WORD RMOD_WIN   = 0x08;
+
+struct SliceAction {
+    const wchar_t* label;
+    const wchar_t* icon;    // Segoe Fluent Icons glyph (PUA codepoint)
+    ActType        type;
+    WORD           mods;    // AT_HOTKEY: modifier bitmask
+    WORD           vk;      // AT_HOTKEY: virtual key
+    const wchar_t* launch;  // AT_LAUNCH: ShellExecute target
+};
+
+// The 8 outer slices, clockwise from 12 o'clock. Hard-coded placeholder set —
+// becomes user-configurable later. Exercises all three action types. Icons are
+// Segoe Fluent Icons glyphs (shipped on Windows 11).
+static const SliceAction g_slices[SEG_COUNT] = {
+    {L"Copy",     L"", AT_HOTKEY, RMOD_CTRL, 'C', nullptr},
+    {L"Paste",    L"", AT_HOTKEY, RMOD_CTRL, 'V', nullptr},
+    {L"Cut",      L"", AT_HOTKEY, RMOD_CTRL, 'X', nullptr},
+    {L"Undo",     L"", AT_HOTKEY, RMOD_CTRL, 'Z', nullptr},
+    {L"Redo",     L"", AT_HOTKEY, RMOD_CTRL, 'Y', nullptr},
+    {L"Find",     L"", AT_HOTKEY, RMOD_CTRL, 'F', nullptr},
+    {L"Explorer", L"", AT_LAUNCH, 0,         0,   L"explorer.exe"},
+    {L"More",     L"", AT_NATIVE, 0,         0,   nullptr},
 };
 
 // ============================================================
@@ -89,6 +126,7 @@ static HWND   g_hwnd      = nullptr;
 static RingState g_state   = ST_IDLE;
 static POINT     g_downPt  = {0, 0};   // where the right button went down (screen px)
 static POINT     g_centerPt = {0, 0};  // ring center on screen (== g_downPt while open)
+static POINT     g_actionPt = {0, 0};  // target captured at selection for a deferred action
 static int       g_hover   = HOVER_NONE;
 static float     g_scale     = 1.0f;
 static float     g_outerR    = 0.0f;   // physical px
@@ -104,6 +142,7 @@ static IDWriteFactory*     g_dwFact  = nullptr;
 static ID2D1DCRenderTarget* g_dcrt   = nullptr;
 static ID2D1SolidColorBrush* g_brush = nullptr;
 static IDWriteTextFormat*  g_textFmt = nullptr;
+static IDWriteTextFormat*  g_iconFmt = nullptr;
 static float               g_textScale = 0.0f;
 
 // GDI layered-window backing surface
@@ -146,21 +185,33 @@ static int HitTest(POINT pt) {
 // Rendering
 // ============================================================
 
-// (Re)create the DIB + DCRenderTarget + brush + text format when the required
-// size (DPI-dependent) changes. Returns false on failure.
+// (Re)create the device-independent text + icon fonts for a given DPI scale.
+static void CreateFonts(float scale) {
+    if (!g_dwFact) return;
+    SafeRelease(&g_textFmt);
+    if (SUCCEEDED(g_dwFact->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            13.0f * scale, L"", &g_textFmt))) {
+        g_textFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_textFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    SafeRelease(&g_iconFmt);
+    if (SUCCEEDED(g_dwFact->CreateTextFormat(
+            L"Segoe Fluent Icons", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            22.0f * scale, L"", &g_iconFmt))) {
+        g_iconFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_iconFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    g_textScale = scale;
+}
+
+// (Re)create the DIB + DCRenderTarget + brush when the required size changes,
+// and refresh fonts when the DPI scale changes. Returns false on failure.
 static bool EnsureSurface(int w, int h, float scale) {
     if (g_dcrt && g_surfW == w && g_surfH == h) {
-        if (g_textScale != scale && g_dwFact) {
-            SafeRelease(&g_textFmt);
-            if (SUCCEEDED(g_dwFact->CreateTextFormat(
-                    L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                    13.0f * scale, L"", &g_textFmt))) {
-                g_textFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                g_textFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            }
-            g_textScale = scale;
-        }
+        if (g_textScale != scale) CreateFonts(scale);
         return g_dcrt != nullptr;
     }
 
@@ -201,51 +252,14 @@ static bool EnsureSurface(int w, int h, float scale) {
 
     g_surfW = w;
     g_surfH = h;
-
-    SafeRelease(&g_textFmt);
-    if (SUCCEEDED(g_dwFact->CreateTextFormat(
-            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-            13.0f * scale, L"", &g_textFmt))) {
-        g_textFmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        g_textFmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    }
-    g_textScale = scale;
+    CreateFonts(scale);
 
     return g_brush != nullptr;
 }
 
-static void FillWedge(float cx, float cy, float innerR, float outerR,
-                      float a0, float a1) {
-    ID2D1PathGeometry* geo = nullptr;
-    if (FAILED(g_d2dFact->CreatePathGeometry(&geo)) || !geo) return;
-    ID2D1GeometrySink* sink = nullptr;
-    if (FAILED(geo->Open(&sink)) || !sink) { geo->Release(); return; }
-
-    sink->BeginFigure(PointOnCircle(cx, cy, innerR, a0), D2D1_FIGURE_BEGIN_FILLED);
-    sink->AddLine(PointOnCircle(cx, cy, outerR, a0));
-    D2D1_ARC_SEGMENT outer = {};
-    outer.point = PointOnCircle(cx, cy, outerR, a1);
-    outer.size = D2D1::SizeF(outerR, outerR);
-    outer.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
-    outer.arcSize = D2D1_ARC_SIZE_SMALL;
-    sink->AddArc(outer);
-    sink->AddLine(PointOnCircle(cx, cy, innerR, a1));
-    D2D1_ARC_SEGMENT inner = {};
-    inner.point = PointOnCircle(cx, cy, innerR, a0);
-    inner.size = D2D1::SizeF(innerR, innerR);
-    inner.sweepDirection = D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE;
-    inner.arcSize = D2D1_ARC_SIZE_SMALL;
-    sink->AddArc(inner);
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    sink->Close();
-    sink->Release();
-
-    g_dcrt->FillGeometry(geo, g_brush);
-    geo->Release();
-}
-
-// Render the ring into g_memDC and blit it to the layered window.
+// Render the ring into g_memDC and blit it to the layered window. Logitech-
+// style: discrete floating bubbles on a transparent backdrop, the hovered one
+// solid + slightly enlarged, a central hub that names the hovered action.
 static void RenderRing() {
     if (!g_dcrt || !g_brush) return;
 
@@ -257,55 +271,52 @@ static void RenderRing() {
 
     float cx = g_surfW / 2.0f;
     float cy = g_surfH / 2.0f;
-    float outerR = g_outerR;
-    float hubR = g_hubR;
+    float hubR    = g_hubR;
+    float bubbleR = BUBBLE_R_DIP * g_scale;
+    float ringR   = BUBBLE_RING_DIP * g_scale;
 
-    // Background disc
-    g_brush->SetColor(D2D1::ColorF(0, 0, 0, 0.80f));
-    g_dcrt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), outerR, outerR), g_brush);
-
-    // Hover highlight wedge
-    if (g_hover >= 0) {
-        g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.16f));
-        FillWedge(cx, cy, hubR, outerR, g_hover * 45.0f - 22.5f, g_hover * 45.0f + 22.5f);
-    }
-
-    // Separators
-    g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.12f));
+    // Action bubbles
     for (int i = 0; i < SEG_COUNT; ++i) {
-        float a = i * 45.0f - 22.5f;
-        g_dcrt->DrawLine(PointOnCircle(cx, cy, hubR, a),
-                         PointOnCircle(cx, cy, outerR, a), g_brush, 1.0f * g_scale);
-    }
+        D2D1_POINT_2F bc = PointOnCircle(cx, cy, ringR, i * 45.0f);
+        bool hot = (i == g_hover);
+        float r = hot ? bubbleR * 1.08f : bubbleR;
+        D2D1_ELLIPSE e = D2D1::Ellipse(bc, r, r);
 
-    // Outer rim
-    g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.25f));
-    g_dcrt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), outerR, outerR),
-                        g_brush, 1.2f * g_scale);
+        g_brush->SetColor(hot ? D2D1::ColorF(0, 0, 0, 0.92f)
+                              : D2D1::ColorF(0, 0, 0, 0.55f));
+        g_dcrt->FillEllipse(e, g_brush);
+        g_brush->SetColor(D2D1::ColorF(1, 1, 1, hot ? 0.55f : 0.16f));
+        g_dcrt->DrawEllipse(e, g_brush, (hot ? 1.6f : 1.0f) * g_scale);
 
-    // Slice labels
-    if (g_textFmt) {
-        float labelR = (hubR + outerR) / 2.0f;
-        for (int i = 0; i < SEG_COUNT; ++i) {
-            D2D1_POINT_2F p = PointOnCircle(cx, cy, labelR, i * 45.0f);
-            D2D1_RECT_F r = D2D1::RectF(p.x - 44 * g_scale, p.y - 14 * g_scale,
-                                        p.x + 44 * g_scale, p.y + 14 * g_scale);
-            g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.92f));
-            g_dcrt->DrawTextW(g_labels[i], (UINT32)wcslen(g_labels[i]),
-                              g_textFmt, r, g_brush);
+        if (g_iconFmt) {
+            float ih = 22.0f * g_scale;
+            D2D1_RECT_F ir = D2D1::RectF(bc.x - ih, bc.y - ih, bc.x + ih, bc.y + ih);
+            g_brush->SetColor(D2D1::ColorF(1, 1, 1, hot ? 1.0f : 0.85f));
+            g_dcrt->DrawTextW(g_slices[i].icon, (UINT32)wcslen(g_slices[i].icon),
+                              g_iconFmt, ir, g_brush);
         }
     }
 
     // Center hub
-    g_brush->SetColor(g_hover == HOVER_HUB ? D2D1::ColorF(1, 1, 1, 0.20f)
-                                           : D2D1::ColorF(0, 0, 0, 0.55f));
-    g_dcrt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), hubR, hubR), g_brush);
-    g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.25f));
-    g_dcrt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), hubR, hubR), g_brush, 1.0f * g_scale);
-    if (g_textFmt) {
+    bool hubHot = (g_hover == HOVER_HUB);
+    D2D1_ELLIPSE hub = D2D1::Ellipse(D2D1::Point2F(cx, cy), hubR, hubR);
+    g_brush->SetColor(hubHot ? D2D1::ColorF(0, 0, 0, 0.92f)
+                             : D2D1::ColorF(0, 0, 0, 0.70f));
+    g_dcrt->FillEllipse(hub, g_brush);
+    g_brush->SetColor(D2D1::ColorF(1, 1, 1, hubHot ? 0.55f : 0.22f));
+    g_dcrt->DrawEllipse(hub, g_brush, 1.2f * g_scale);
+
+    if (g_hover >= 0 && g_hover < SEG_COUNT && g_textFmt) {
+        // Name the hovered action so the icons stay discoverable.
+        D2D1_RECT_F r = D2D1::RectF(cx - hubR + 2, cy - hubR, cx + hubR - 2, cy + hubR);
+        g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.95f));
+        g_dcrt->DrawTextW(g_slices[g_hover].label, (UINT32)wcslen(g_slices[g_hover].label),
+                          g_textFmt, r, g_brush);
+    } else if (g_iconFmt) {
+        // Idle / hub hovered: a menu glyph hints "native context menu".
         D2D1_RECT_F r = D2D1::RectF(cx - hubR, cy - hubR, cx + hubR, cy + hubR);
         g_brush->SetColor(D2D1::ColorF(1, 1, 1, 0.95f));
-        g_dcrt->DrawTextW(L"Win", 3, g_textFmt, r, g_brush);
+        g_dcrt->DrawTextW(L"", 1, g_iconFmt, r, g_brush);
     }
 
     if (g_dcrt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) {
@@ -383,12 +394,67 @@ static void SynthRightClick(POINT pt) {
     SendInput(2, in, sizeof(INPUT));
 }
 
+// Inject a modifier+key chord into the focused app. Our overlay never takes
+// focus (WS_EX_NOACTIVATE), so the app the user right-clicked still owns it and
+// receives the keystrokes. The right button is already released by selection
+// time, so no stray button state interferes.
+static void SendHotkey(WORD mods, WORD vk) {
+    INPUT seq[12] = {};
+    int n = 0;
+    auto key = [&](WORD k, bool up) {
+        seq[n].type = INPUT_KEYBOARD;
+        seq[n].ki.wVk = k;
+        if (up) seq[n].ki.dwFlags = KEYEVENTF_KEYUP;
+        ++n;
+    };
+    if (mods & RMOD_CTRL)  key(VK_CONTROL, false);
+    if (mods & RMOD_ALT)   key(VK_MENU,    false);
+    if (mods & RMOD_SHIFT) key(VK_SHIFT,   false);
+    if (mods & RMOD_WIN)   key(VK_LWIN,    false);
+    key(vk, false);
+    key(vk, true);
+    if (mods & RMOD_WIN)   key(VK_LWIN,    true);
+    if (mods & RMOD_SHIFT) key(VK_SHIFT,   true);
+    if (mods & RMOD_ALT)   key(VK_MENU,    true);
+    if (mods & RMOD_CTRL)  key(VK_CONTROL, true);
+    SendInput(n, seq, sizeof(INPUT));
+}
+
+// Perform a selection. idx 0..SEG_COUNT-1 = outer slice, SEG_COUNT = hub. Runs
+// on the worker thread (posted from the hook) so ShellExecute / SendInput never
+// block the low-level mouse hook callback.
+static void DispatchAction(int idx) {
+    if (idx == SEG_COUNT) {            // center hub: app's own context menu
+        SynthRightClick(g_actionPt);
+        return;
+    }
+    if (idx < 0 || idx >= SEG_COUNT) return;
+    const SliceAction& a = g_slices[idx];
+    switch (a.type) {
+        case AT_HOTKEY:
+            SendHotkey(a.mods, a.vk);
+            break;
+        case AT_LAUNCH:
+            if (a.launch)
+                ShellExecuteW(nullptr, L"open", a.launch, nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case AT_NATIVE:
+            SynthRightClick(g_actionPt);
+            break;
+    }
+}
+
+// Called from the hook on release. Captures the target point and posts the
+// action to the worker thread; the hook returns immediately.
 static void OnSelect(int hover) {
     if (hover == HOVER_HUB) {
         Wh_Log(L"Ring: HUB -> native menu at (%d,%d)", g_downPt.x, g_downPt.y);
-        SynthRightClick(g_downPt);  // show the app's own context menu
-    } else if (hover >= 0) {
-        Wh_Log(L"Ring: selected slice %d (%ls)", hover, g_labels[hover]);
+        g_actionPt = g_downPt;
+        PostMessage(g_hwnd, WM_RING_ACTION, (WPARAM)SEG_COUNT, 0);
+    } else if (hover >= 0 && hover < SEG_COUNT) {
+        Wh_Log(L"Ring: slice %d (%ls)", hover, g_slices[hover].label);
+        g_actionPt = g_downPt;
+        PostMessage(g_hwnd, WM_RING_ACTION, (WPARAM)hover, 0);
     } else {
         Wh_Log(L"Ring: cancelled (released outside)");
     }
@@ -449,6 +515,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_state = ST_OPEN;
             ShowRing(g_downPt);
         }
+        return 0;
+    }
+    if (msg == WM_RING_ACTION) {
+        DispatchAction((int)wp);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -513,6 +583,7 @@ cleanup:
     SafeRelease(&g_brush);
     SafeRelease(&g_dcrt);
     SafeRelease(&g_textFmt);
+    SafeRelease(&g_iconFmt);
     if (g_memDC) {
         if (g_oldBmp) SelectObject(g_memDC, g_oldBmp);
         DeleteDC(g_memDC);
