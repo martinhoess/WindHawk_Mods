@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              right-click-ring
 // @name            Right-Click Ring
-// @description     Holding the right mouse button opens a Logitech-style radial overlay at the cursor. The 8 slices show icons and run actions (clipboard/edit hotkeys, app launch, native menu); the center hub names the hovered slice and falls through to the app's own context menu. A quick right-click still shows it directly.
-// @version         0.4
+// @description     Holding the right mouse button opens a Logitech-style radial overlay at the cursor. The 8 slices show icons and run actions (clipboard/edit hotkeys, app launch, native menu); the center hub names the hovered slice and falls through to the app's own context menu. A quick right-click still shows it directly. A right-drag, and any app on the denylist, pass through untouched.
+// @version         0.5
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @include         explorer.exe
@@ -18,6 +18,9 @@
 - holdMs: 250
   $name: Hold threshold (ms)
   $description: "How long the right button must be held before the ring opens. A shorter press passes through as a normal right-click — but normal right-clicks are delayed by up to this many ms while the mod decides. 200-300 feels natural."
+- denyList: ""
+  $name: App denylist
+  $description: "Semicolon-separated process names (e.g. game.exe;mstsc.exe). While one of these is the foreground app the ring is disabled and right-click behaves completely normally. Useful for games, remote desktop, or any app whose own right-click you want untouched."
 */
 // ==/WindhawkModSettings==
 
@@ -49,6 +52,8 @@
 #include <dwrite.h>
 #include <shellscalingapi.h>
 #include <atomic>
+#include <vector>
+#include <string>
 #include <cmath>
 
 // ============================================================
@@ -114,7 +119,7 @@ static const SliceAction g_slices[SEG_COUNT] = {
 // State
 // ============================================================
 
-enum RingState { ST_IDLE, ST_PENDING, ST_OPEN };
+enum RingState { ST_IDLE, ST_PENDING, ST_OPEN, ST_PASSTHRU };
 
 static DWORD  g_threadId = 0;
 static HANDLE g_thread   = nullptr;
@@ -135,6 +140,13 @@ static float     g_hubR      = 0.0f;   // physical px
 // Settings (read from hook thread, written from Windhawk thread)
 static std::atomic<bool> g_enabled{true};
 static std::atomic<int>  g_holdMs{250};
+static int g_dragSlop = 8;  // px; movement during PENDING beyond this = drag, not hold
+
+// Denylist of foreground process names. Checked on the hook thread, written by
+// ReadSettings on the Windhawk thread (guarded by g_denyCs).
+static std::vector<std::wstring> g_denyList;
+static CRITICAL_SECTION          g_denyCs;
+static bool                      g_denyCsInit = false;
 
 // D2D / DWrite
 static ID2D1Factory*       g_d2dFact = nullptr;
@@ -365,33 +377,42 @@ static void HideRing() {
     g_hover = HOVER_NONE;
 }
 
-// Emit a normal right-click at a screen point so the focused app shows its own
-// native context menu there. Marked with the sentinel so our own hook lets the
-// synthetic events through untouched (no re-entry, no ring re-trigger). The
-// down event also moves the cursor to `pt` via absolute positioning, so the
-// menu appears exactly where the user originally pressed — not wherever the
-// cursor drifted while the ring was open.
-static void SynthRightClick(POINT pt) {
+// Build an absolute-position mouse INPUT for screen point `pt`, tagged with the
+// sentinel so our own hook ignores it. Coords normalize over the virtual desktop.
+static INPUT MakeAbsMouse(POINT pt, DWORD flags) {
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     if (vw < 2) vw = 2;
     if (vh < 2) vh = 2;
-    LONG nx = (LONG)(((double)(pt.x - vx) * 65535.0) / (vw - 1));
-    LONG ny = (LONG)(((double)(pt.y - vy) * 65535.0) / (vh - 1));
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = (LONG)(((double)(pt.x - vx) * 65535.0) / (vw - 1));
+    in.mi.dy = (LONG)(((double)(pt.y - vy) * 65535.0) / (vh - 1));
+    in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | flags;
+    in.mi.dwExtraInfo = RING_SENTINEL;
+    return in;
+}
 
+// Emit a full right-click at a screen point so the focused app shows its own
+// native context menu there, exactly where the user pressed (not where the
+// cursor drifted while the ring was open).
+static void SynthRightClick(POINT pt) {
     INPUT in[2] = {};
-    in[0].type = INPUT_MOUSE;
-    in[0].mi.dx = nx;
-    in[0].mi.dy = ny;
-    in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE |
-                       MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_RIGHTDOWN;
-    in[0].mi.dwExtraInfo = RING_SENTINEL;
+    in[0] = MakeAbsMouse(pt, MOUSEEVENTF_RIGHTDOWN);
     in[1].type = INPUT_MOUSE;
     in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
     in[1].mi.dwExtraInfo = RING_SENTINEL;
     SendInput(2, in, sizeof(INPUT));
+}
+
+// Emit only the right-button press (at the original point) when a right-drag is
+// detected, so the app receives the down it never saw; the live moves + the
+// real release then flow through to complete the drag naturally.
+static void SynthRightDownAt(POINT pt) {
+    INPUT in = MakeAbsMouse(pt, MOUSEEVENTF_RIGHTDOWN);
+    SendInput(1, &in, sizeof(INPUT));
 }
 
 // Inject a modifier+key chord into the focused app. Our overlay never takes
@@ -464,6 +485,43 @@ static void OnSelect(int hover) {
 // Mouse hook + window proc (both on the worker thread)
 // ============================================================
 
+// Foreground window's executable basename, lowercased. Empty on failure.
+static std::wstring GetForegroundExeName() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return L"";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return L"";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t path[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(h, 0, path, &sz);
+    CloseHandle(h);
+    if (!ok || sz == 0) return L"";
+    const wchar_t* base = path;
+    for (DWORD i = 0; i < sz; i++)
+        if (path[i] == L'\\' || path[i] == L'/') base = &path[i + 1];
+    std::wstring name(base);
+    int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+        name.c_str(), (int)name.size(), name.data(), (int)name.size(),
+        nullptr, nullptr, 0);
+    if (n > 0) name.resize(n);
+    return name;
+}
+
+static bool IsForegroundDenied() {
+    if (!g_denyCsInit) return false;
+    std::wstring exe = GetForegroundExeName();
+    if (exe.empty()) return false;
+    bool denied = false;
+    EnterCriticalSection(&g_denyCs);
+    for (const auto& d : g_denyList)
+        if (d == exe) { denied = true; break; }
+    LeaveCriticalSection(&g_denyCs);
+    return denied;
+}
+
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
     if (code != HC_ACTION || !g_enabled.load())
         return CallNextHookEx(nullptr, code, wp, lp);
@@ -474,10 +532,13 @@ static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
 
     switch (wp) {
         case WM_RBUTTONDOWN:
+            // Denylisted foreground app -> stay completely out of the way.
+            if (IsForegroundDenied())
+                return CallNextHookEx(nullptr, code, wp, lp);
             g_downPt = ms->pt;
             g_state = ST_PENDING;
             SetTimer(g_hwnd, TIMER_HOLD, (UINT)g_holdMs.load(), nullptr);
-            return 1;  // swallow; decide on UP or timer
+            return 1;  // swallow; decide on move / up / timer
 
         case WM_RBUTTONUP:
             if (g_state == ST_PENDING) {
@@ -493,9 +554,31 @@ static LRESULT CALLBACK MouseHookProc(int code, WPARAM wp, LPARAM lp) {
                 OnSelect(hover);
                 return 1;
             }
+            if (g_state == ST_PASSTHRU) {
+                // A right-drag we handed back to the app: let the real
+                // release through to complete it.
+                g_state = ST_IDLE;
+                return CallNextHookEx(nullptr, code, wp, lp);
+            }
             return CallNextHookEx(nullptr, code, wp, lp);
 
         case WM_MOUSEMOVE:
+            if (g_state == ST_PENDING) {
+                // Move-guard: a right-drag must NOT open the ring. Once the
+                // cursor leaves the slop box before the hold fires, hand the
+                // gesture back as a real drag — synth the press the app never
+                // saw (at the original point), then stop swallowing so the
+                // live moves + release flow through.
+                int dx = ms->pt.x - g_downPt.x;
+                int dy = ms->pt.y - g_downPt.y;
+                if (dx * dx + dy * dy > g_dragSlop * g_dragSlop) {
+                    KillTimer(g_hwnd, TIMER_HOLD);
+                    g_state = ST_PASSTHRU;
+                    SynthRightDownAt(g_downPt);
+                    return 1;  // swallow this move so it lands after the synth down
+                }
+                return 1;  // still deciding — keep swallowing
+            }
             if (g_state == ST_OPEN) {
                 int hover = HitTest(ms->pt);
                 if (hover != g_hover) {
@@ -530,6 +613,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 static DWORD WINAPI RingThread(LPVOID) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    // Drag slop = a bit more than the system drag size, so a tiny twitch while
+    // pressing doesn't cancel the ring. Constant after this point.
+    int slop = GetSystemMetrics(SM_CXDRAG) * 2;
+    g_dragSlop = slop < 8 ? 8 : slop;
 
     D2D1_FACTORY_OPTIONS fo = {};
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -601,17 +689,59 @@ cleanup:
 // Windhawk entry points
 // ============================================================
 
+// Split a semicolon-separated list into trimmed, invariant-lowercased names.
+static std::vector<std::wstring> ParseDenyList(LPCWSTR s) {
+    std::vector<std::wstring> out;
+    if (!s) return out;
+    std::wstring cur;
+    for (const wchar_t* p = s; ; ++p) {
+        if (*p == L';' || *p == L'\0') {
+            size_t a = 0, b = cur.size();
+            while (a < b && (cur[a] == L' ' || cur[a] == L'\t')) ++a;
+            while (b > a && (cur[b-1] == L' ' || cur[b-1] == L'\t')) --b;
+            if (b > a) {
+                std::wstring item(cur, a, b - a);
+                int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE,
+                    item.c_str(), (int)item.size(), item.data(), (int)item.size(),
+                    nullptr, nullptr, 0);
+                if (n > 0) item.resize(n);
+                out.push_back(std::move(item));
+            }
+            cur.clear();
+            if (*p == L'\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+    return out;
+}
+
 static void ReadSettings() {
     g_enabled.store(Wh_GetIntSetting(L"enabled") != 0);
     int h = Wh_GetIntSetting(L"holdMs");
     if (h < 50)   h = 50;
     if (h > 1000) h = 1000;
     g_holdMs.store(h);
-    Wh_Log(L"Settings: enabled=%d holdMs=%d", (int)g_enabled.load(), g_holdMs.load());
+
+    LPCWSTR deny = Wh_GetStringSetting(L"denyList");
+    auto parsed = ParseDenyList(deny);
+    Wh_FreeStringSetting(deny);
+    if (g_denyCsInit) {
+        EnterCriticalSection(&g_denyCs);
+        g_denyList = std::move(parsed);
+        LeaveCriticalSection(&g_denyCs);
+    } else {
+        g_denyList = std::move(parsed);
+    }
+
+    Wh_Log(L"Settings: enabled=%d holdMs=%d denyN=%zu",
+        (int)g_enabled.load(), g_holdMs.load(), g_denyList.size());
 }
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Right-Click Ring: init");
+    InitializeCriticalSection(&g_denyCs);
+    g_denyCsInit = true;
     ReadSettings();
     g_hookReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_thread = CreateThread(nullptr, 0, RingThread, nullptr, 0, &g_threadId);
@@ -655,5 +785,9 @@ void Wh_ModUninit() {
         else
             CloseHandle(g_thread);
         g_thread = nullptr;
+    }
+    if (g_denyCsInit) {
+        DeleteCriticalSection(&g_denyCs);
+        g_denyCsInit = false;
     }
 }
