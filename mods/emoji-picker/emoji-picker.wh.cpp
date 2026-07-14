@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
-// @version         1.8
+// @version         1.9
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -1754,6 +1754,7 @@ constexpr int TAB_TOP  = HINT_BOT;
 constexpr int WIN_H    = TAB_TOP + TAB_H;            // 48+42+1+378+22+52 = 543
 constexpr int NUM_CATS = 10;                           // 0=Recent, 1-9=emoji
 constexpr int MAX_RECENT = 45;
+constexpr int MAX_USECOUNTS = 512;  // cap distinct emoji tracked for ranking
 
 constexpr UINT WM_SHOW_PICKER   = WM_USER + 1;
 constexpr UINT WM_INSERT_EMOJI  = WM_USER + 2;
@@ -1905,6 +1906,9 @@ struct ShortcodeTrigger {
 };
 static std::vector<int>               g_filtered;
 static std::vector<std::wstring>      g_recent;
+// Per-emoji lifetime pick count — used to rank search hits by how often the
+// user actually picks each emoji. Persisted alongside Recent in the registry.
+static std::unordered_map<std::wstring, uint32_t> g_useCount;
 static std::vector<IDWriteTextLayout*> g_emojiLayouts;  // pre-created, one per emoji
 static std::wstring                   g_pending;   // emoji to insert after focus handoff
 static wchar_t                   g_query[128] = {};
@@ -1976,12 +1980,94 @@ static void LoadRecent() {
     }
 }
 
+// --- Usage counts (registry, parallel to Recent) ---
+// Stored as REG_MULTI_SZ where each string is "<emoji>\t<count>". Kept separate
+// from Recent so the MRU row and the frequency ranking evolve independently.
+static void SaveUseCounts() {
+    std::wstring ms;
+    for (auto& kv : g_useCount) {
+        ms += kv.first;
+        ms += L'\t';
+        ms += std::to_wstring(kv.second);
+        ms += L'\0';
+    }
+    if (ms.empty()) ms += L'\0';  // empty map still needs a double-NUL MULTI_SZ
+    ms += L'\0';
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+        L"Software\\WindhawkMods\\EmojiPicker",
+        0, nullptr, 0, KEY_WRITE, nullptr, &hk, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(hk, L"UseCounts", 0, REG_MULTI_SZ,
+            (BYTE*)ms.data(), (DWORD)(ms.size() * sizeof(wchar_t)));
+        RegCloseKey(hk);
+    }
+}
+
+static void LoadUseCounts() {
+    g_useCount.clear();
+    DWORD sz = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WindhawkMods\\EmojiPicker",
+        L"UseCounts", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &sz) != ERROR_SUCCESS || sz < 4)
+        return;
+    std::vector<wchar_t> buf(sz / sizeof(wchar_t));
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WindhawkMods\\EmojiPicker",
+        L"UseCounts", RRF_RT_REG_MULTI_SZ, nullptr, buf.data(), &sz) != ERROR_SUCCESS)
+        return;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+        const wchar_t* tab = wcschr(p, L'\t');
+        if (!tab) continue;
+        g_useCount[std::wstring(p, tab)] = (uint32_t)_wtoi(tab + 1);
+    }
+}
+
 static void AddToRecent(const wchar_t* ch) {
     std::wstring e(ch);
     g_recent.erase(std::remove(g_recent.begin(), g_recent.end(), e), g_recent.end());
     g_recent.insert(g_recent.begin(), e);
     if ((int)g_recent.size() > MAX_RECENT) g_recent.resize(MAX_RECENT);
     SaveRecent();
+
+    g_useCount[e]++;
+    // Keep the store bounded — evict the least-used entry (never the one just
+    // bumped) once we exceed the cap.
+    if ((int)g_useCount.size() > MAX_USECOUNTS) {
+        auto lo = std::min_element(g_useCount.begin(), g_useCount.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+        if (lo != g_useCount.end() && lo->first != e) g_useCount.erase(lo);
+    }
+    SaveUseCounts();
+}
+
+// Cold-start popularity weights (approx. global emoji frequency ranking).
+// Only breaks ties before the user has built up personal counts — one real
+// pick (worth 1000 in EmojiScore) outranks any seed value here.
+static int SeedWeight(const wchar_t* ch) {
+    static const std::unordered_map<std::wstring, int> seed = {
+        {L"\xD83D\xDE02", 500},  // 😂 face with tears of joy
+        {L"\x2764\xFE0F", 480},  // ❤️ red heart
+        {L"\xD83E\xDD23", 460},  // 🤣 rolling on the floor laughing
+        {L"\xD83D\xDC4D", 440},  // 👍 thumbs up
+        {L"\xD83D\xDE2D", 420},  // 😭 loudly crying face
+        {L"\xD83D\xDE4F", 400},  // 🙏 folded hands
+        {L"\xD83E\xDD70", 380},  // 🥰 smiling face with hearts
+        {L"\xD83D\xDE0D", 360},  // 😍 smiling face with heart-eyes
+        {L"\xD83D\xDD25", 340},  // 🔥 fire
+        {L"\xD83D\xDC4E", 200},  // 👎 thumbs down
+    };
+    auto it = seed.find(ch);
+    return it != seed.end() ? it->second : 0;
+}
+
+// Ranking key for search hits: personal pick count dominates, cold-start seed
+// (or curated shortcode weight) breaks ties before any picks exist.
+static long long EmojiScore(int emojiIdx) {
+    const wchar_t* ch = g_emojis[emojiIdx].ch;
+    long long uses = 0;
+    auto it = g_useCount.find(ch);
+    if (it != g_useCount.end()) uses = it->second;
+    int base = g_emojis[emojiIdx].weight;
+    int seed = SeedWeight(ch);
+    return uses * 1000LL + (base > seed ? base : seed);
 }
 
 // ============================================================
@@ -2233,6 +2319,16 @@ static void UpdateFilter() {
                   || (g_emojis[i].kw && wcsstr(g_emojis[i].kw, g_query));
             if (m) g_filtered.push_back(i);
         }
+        // Rank hits by usage: most-picked first, cold-start seed as tiebreak.
+        // Score each hit once (EmojiScore does map lookups + temporary
+        // wstrings), then stable_sort keeps Unicode order for equal scores —
+        // cheaper than scoring inside an O(N log N) comparator.
+        std::vector<std::pair<long long, int>> scored;
+        scored.reserve(g_filtered.size());
+        for (int idx : g_filtered) scored.emplace_back(EmojiScore(idx), idx);
+        std::stable_sort(scored.begin(), scored.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (size_t k = 0; k < scored.size(); k++) g_filtered[k] = scored[k].second;
     } else if (g_cat == 0) {
         for (auto& r : g_recent)
             for (int i = 0; i < g_emojiCount; i++)
@@ -2296,7 +2392,11 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                     g_hoverRecent = -1;
                 }
                 // VK_UP: stay in recent bar
-            } else if (!g_filtered.empty()) {
+            } else if (g_filtered.empty()) {
+                // No grid hits (e.g. search with no results): any arrow drops
+                // into the recent bar so it stays keyboard-selectable.
+                if (recentCount > 0) g_hoverRecent = 0;
+            } else {
                 int total = (int)g_filtered.size();
                 int cur   = g_hoverIdx;
                 if (cur < 0) {
@@ -2883,6 +2983,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_hbEdit = CreateSolidBrush(g_theme->editBg);
         LoadRecent();
+        LoadUseCounts();
 
         // D2D text formats
         if (g_dwFact) {
