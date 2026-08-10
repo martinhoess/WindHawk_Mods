@@ -2,7 +2,7 @@
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
-// @version         1.9
+// @version         1.11
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -1914,6 +1914,12 @@ static std::wstring                   g_pending;   // emoji to insert after focu
 static wchar_t                   g_query[128] = {};
 
 static const Theme* g_theme = &DARK;
+// Theme and DPI the current render target + brushes were built for. The target
+// is only torn down when one of them actually changed — rebuilding it on every
+// show made the first show after a mod load pay for a cold D2D device on the
+// same thread that dispatches the keyboard hook.
+static const Theme* g_rtTheme = nullptr;
+static UINT         g_rtDpi   = 0;
 
 // D2D / DWrite
 static ID2D1Factory*          g_d2dFact  = nullptr;
@@ -2564,7 +2570,10 @@ static std::wstring ComposeHintText() {
 }
 
 static void RenderFrame() {
-    if (!g_rt) return;
+    // No !g_rt guard here: the warm-up render at load time has to be allowed
+    // to build the render target itself. Bailing out early left all the cold
+    // D2D work for the first Win+. — on the very thread that dispatches the
+    // low-level keyboard hook.
     if (FAILED(CreateDeviceResources(g_hwnd))) return;
 
     g_rt->BeginDraw();
@@ -2821,10 +2830,6 @@ static void ShowPickerAt(PickerTrigger* trigger) {
     if (g_hideFlags && g_cat == 9) g_cat = 1;
     SetWindowTextW(g_searchEdit, L"");
 
-    // Recreate D2D brushes for new theme
-    DiscardDeviceResources();
-    CreateDeviceResources(g_hwnd);
-
     UpdateFilter();
 
     // Position near caret / cursor (captured by hook; fallback to current cursor)
@@ -2886,6 +2891,21 @@ static void ShowPickerAt(PickerTrigger* trigger) {
         g_ctrlDown = false;
         g_altDown  = false;
     }
+    // Size and position while the window is still hidden, build the render
+    // target for the monitor we actually land on, and paint one frame — only
+    // then show it. Showing first meant the cold first paint (D2D device,
+    // Segoe UI Emoji glyph cache) ran with the window already on screen, so
+    // the first open after a mod load or boot showed a black rectangle.
+    SetWindowPos(g_hwnd, nullptr, x, y, physW, physH,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+    if (g_rtTheme != g_theme || g_rtDpi != dpi) {
+        DiscardDeviceResources();      // brushes are theme-bound, target is DPI-bound
+        g_rtTheme = g_theme;
+        g_rtDpi   = dpi;
+    }
+    CreateDeviceResources(g_hwnd);
+    RenderFrame();
+
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, physW, physH, SWP_SHOWWINDOW);
 
     // SetForegroundWindow refuses to move focus when our process isn't in the
@@ -2945,6 +2965,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_WARMUP: {
+        // Paint one frame into the still-hidden window: loads the D2D device,
+        // Segoe UI Emoji and the glyph cache now instead of during the first
+        // Win+. This thread also dispatches the low-level keyboard hook, so a
+        // cold render there can blow the hook timeout and let the keystroke
+        // through to the system emoji dialog.
+        DWORD t0 = GetTickCount();
+        RenderFrame();
+        Wh_Log(L"Warmup render: %u ms, rt=%p", GetTickCount() - t0, (void*)g_rt);
         HANDLE h = CreateThread(nullptr, 0, WarmupWorker, nullptr, 0, nullptr);
         if (h) CloseHandle(h);
         return 0;
@@ -2955,6 +2983,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (auto& p : g_emojiLayouts) if (p) { p->Release(); p = nullptr; }
         g_emojiLayouts = std::move(*v);
         delete v;
+        RenderFrame();                  // warm the layouts while still hidden
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -3174,6 +3203,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE && !g_inserting)
             ShowWindow(hwnd, SW_HIDE);
+        else
+            // ShowPickerAt already calls SetFocus, but on the first open the
+            // activation triggered by SetForegroundWindow can land after it
+            // and move focus back to the top-level window — the picker is
+            // then visible but typing does nothing. Setting focus here covers
+            // every activation, whenever it arrives.
+            SetFocus(g_searchEdit);
         return 0;
 
     case WM_ERASEBKGND:
