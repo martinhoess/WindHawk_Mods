@@ -1,8 +1,8 @@
-// ==WindhawkMod==
+﻿// ==WindhawkMod==
 // @id              emoji-picker
 // @name            Emoji Picker
 // @description     Replaces the Windows 11 emoji dialog (Win+.) with a Windows 10-inspired picker: dark/light theme, real-time search, category tabs, recent emoji, and optional inline :name: shortcode expansion (DE+EN).
-// @version         1.11
+// @version         1.16
 // @author          martinhoess
 // @github          https://github.com/martinhoess
 // @license         WTFPL
@@ -36,6 +36,9 @@
 - shortcodeDenyList: "cmd.exe;conhost.exe;WindowsTerminal.exe;mstsc.exe;powershell.exe;pwsh.exe"
   $name: Shortcode denylist
   $description: "Semicolon-separated list of process names (e.g. cmd.exe). Shortcode expansion is disabled while one of these is the foreground app. Terminals and remote desktop are excluded by default — backspace replay is unreliable there."
+- trace: false
+  $name: Diagnose-Trace
+  $description: "Schreibt Start, Auslöser und Anzeige-Zeiten nach %LOCALAPPDATA%\\WindhawkMods\\EmojiPicker\\trace.log. Für die Fehlersuche beim ersten Öffnen nach einem Neustart. Kostet pro Zeile ein WriteFile auf dem Thread, der den Tastatur-Hook bedient — bei normalem Betrieb ausschalten."
 - logUsage: false
   $name: Log emoji selections
   $description: "Append each picked or expanded emoji to a TSV file under %LOCALAPPDATA%\\WindhawkMods\\EmojiPicker\\stats.tsv. Useful for deriving your personal top-10 over time, then hand-curating the shortcut/weight fields. Off by default."
@@ -55,6 +58,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <shlobj.h>
+#include <cstdarg>
 
 // ============================================================
 // Emoji data structure — must be defined before emoji-data.h
@@ -1759,7 +1763,6 @@ constexpr int MAX_USECOUNTS = 512;  // cap distinct emoji tracked for ranking
 constexpr UINT WM_SHOW_PICKER   = WM_USER + 1;
 constexpr UINT WM_INSERT_EMOJI  = WM_USER + 2;
 constexpr UINT WM_HIDE_PICKER   = WM_USER + 3;
-constexpr UINT WM_WARMUP        = WM_USER + 4;
 constexpr UINT WM_LAYOUTS_READY = WM_USER + 5;
 constexpr UINT WM_SYNTH_F23     = WM_USER + 6;  // hand-off so SendInput runs off the hook thread
 constexpr UINT WM_INSERT_SHORTCODE = WM_USER + 7;  // inject :name: → emoji
@@ -1818,6 +1821,9 @@ static HWND   g_searchEdit = nullptr;
 static HHOOK  g_kbHook     = nullptr;
 static DWORD  g_threadId   = 0;
 static HANDLE g_thread     = nullptr;
+// Der Layout-Bau greift auf g_emojis in dieser DLL zu. Ohne Warten darauf
+// entlädt Windhawk beim Reload die DLL unter dem laufenden Thread weg.
+static HANDLE g_warmupThread = nullptr;
 static HANDLE g_hookReady  = nullptr;  // signalled after SetWindowsHookExW attempt
 static HWND   g_prevFocus  = nullptr;
 // g_inserting is currently only touched on the worker thread (SelectEmoji*,
@@ -1826,6 +1832,10 @@ static HWND   g_prevFocus  = nullptr;
 // Making it std::atomic is a no-op on the hot path (aligned relaxed load/store)
 // and future-proofs against a refactor that e.g. reads it from the hook proc.
 static std::atomic<bool> g_inserting {false};
+// Läuft, solange ShowPickerAt das Fenster aufbaut. Die Fokusübergabe darin
+// erzeugt kurz ein WA_INACTIVE; ohne diese Sperre versteckt der WM_ACTIVATE-
+// Zweig den Picker mitten im Öffnen wieder.
+static std::atomic<bool> g_showing {false};
 enum class AltShortcut { CtrlPeriod, CtrlSpace, AltPeriod, Disabled };
 
 // Trigger data captured by the hook proc and handed to the UI thread via
@@ -1853,6 +1863,12 @@ static std::atomic<bool>   g_hideFlags        {false};  // setting: hide flags c
 static std::atomic<bool>   g_shortcodesEnabled {false}; // setting: inline :name: expansion
 static std::atomic<int>    g_shortcodeDelayMs {0};      // setting: delay between injected keystrokes (ms)
 static std::atomic<bool>   g_logUsage          {false}; // setting: append picks to stats.tsv
+static std::atomic<bool>   g_trace             {false}; // setting: write trace.log
+// Einmal in Wh_ModInit geöffnet und bis zum Uninit offen gehalten. Trace läuft
+// auf dem Thread, der auch den WH_KEYBOARD_LL-Hook abarbeitet — pro Zeile
+// zweimal CreateDirectory, CreateFile und CloseHandle war genau die Sorte
+// Datei-I/O, die den Hook über LowLevelHooksTimeout schiebt.
+static HANDLE              g_traceFile = INVALID_HANDLE_VALUE;
 // g_shortcodeDenyList: never touched from the hook thread (only checked on the
 // UI thread before WM_INSERT_SHORTCODE runs), so plain std::vector + a mutex
 // taken by ReadSettings is enough.
@@ -1860,6 +1876,14 @@ static std::vector<std::wstring> g_shortcodeDenyList;
 static CRITICAL_SECTION          g_shortcodeDenyCs;
 static bool                      g_shortcodeDenyCsInit = false;
 static POINT  g_anchorPt         = {};     // caret/cursor pos captured at hook time
+
+// Buchhaltung zum Auslöser: im Hook-Thread gesetzt, vom UI-Thread ins Trace
+// geschrieben.
+static std::atomic<double>         g_trigMs  {0.0};   // NowMs() beim Absenden
+static std::atomic<double>         g_hookMs  {0.0};   // Dauer dieses Hook-Aufrufs
+static std::atomic<int>            g_trigSeq {0};
+static std::atomic<const wchar_t*> g_trigHow {L"?"};
+
 
 static int    g_cat        = 1;
 static int    g_scrollY    = 0;
@@ -2093,22 +2117,97 @@ static long long EmojiScore(int emojiIdx) {
 // File: %LOCALAPPDATA%\WindhawkMods\EmojiPicker\stats.tsv
 // Format chosen so it opens in Excel/LibreOffice and parses cleanly in
 // Python (just `csv.reader(open(p, encoding='utf-8'), delimiter='\t')`).
+// Legt %LOCALAPPDATA%\\WindhawkMods\\EmojiPicker an und schreibt den Pfad nach
+// out. Von Nutzungsstatistik und Diagnose-Trace gemeinsam genutzt.
+static bool EmojiDataDir(wchar_t out[MAX_PATH]) {
+    wchar_t baseDir[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, baseDir)))
+        return false;
+    // CreateDirectory legt nur die letzte Komponente an, Eltern von Hand.
+    wchar_t parent[MAX_PATH];
+    swprintf(parent, MAX_PATH, L"%s\\WindhawkMods", baseDir);
+    CreateDirectoryW(parent, nullptr);
+    swprintf(out, MAX_PATH, L"%s\\WindhawkMods\\EmojiPicker", baseDir);
+    CreateDirectoryW(out, nullptr);
+    return true;
+}
+
+// Millisekunden mit Unternachkommastelle — die 15,6-ms-Stufe von GetTickCount
+// ist für die Phasen hier zu grob.
+static double NowMs() {
+    LARGE_INTEGER f, c;
+    if (!QueryPerformanceFrequency(&f) || !f.QuadPart) return 0.0;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+
+// Hängt eine Zeile an trace.log neben stats.tsv und spiegelt sie ins Wh_Log.
+// Interessant ist der erste Win+. nach einem Boot — das Windhawk-Logfenster
+// überlebt den Reboot nicht, eine Datei schon.
+// Öffnet trace.log einmalig. Über 1 MB wird die Datei neu angefangen statt
+// ewig weiterzuwachsen — interessant ist immer nur der letzte Start.
+static void OpenTraceFile() {
+    if (g_traceFile != INVALID_HANDLE_VALUE) return;
+    wchar_t dir[MAX_PATH];
+    if (!EmojiDataDir(dir)) return;
+    wchar_t path[MAX_PATH];
+    swprintf(path, MAX_PATH, L"%s\\trace.log", dir);
+
+    DWORD disp = OPEN_ALWAYS;
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad) &&
+        (((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow) > 1024 * 1024)
+        disp = CREATE_ALWAYS;
+
+    g_traceFile = CreateFileW(path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, disp,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static void CloseTraceFile() {
+    if (g_traceFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_traceFile);
+        g_traceFile = INVALID_HANDLE_VALUE;
+    }
+}
+
+static void Trace(const wchar_t* fmt, ...) {
+    if (!g_trace.load(std::memory_order_relaxed)) return;
+    wchar_t msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vswprintf(msg, 512, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    Wh_Log(L"%s", msg);
+    if (g_traceFile == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t line[640];
+    int m = swprintf(line, 640, L"%02u:%02u:%02u.%03u  up=%llus  %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        (unsigned long long)(GetTickCount64() / 1000), msg);
+    if (m <= 0) return;
+
+    // FILE_APPEND_DATA: WriteFile hängt atomar an, auch wenn zwei Threads
+    // gleichzeitig loggen. Kein Lock nötig.
+    int u8size = WideCharToMultiByte(CP_UTF8, 0, line, m, nullptr, 0, nullptr, nullptr);
+    if (u8size > 0) {
+        std::vector<char> u8(u8size);
+        WideCharToMultiByte(CP_UTF8, 0, line, m, u8.data(), u8size, nullptr, nullptr);
+        DWORD wr = 0;
+        WriteFile(g_traceFile, u8.data(), (DWORD)u8size, &wr, nullptr);
+    }
+}
+
 static void LogEmojiUsage(const wchar_t* emoji, const wchar_t* source,
                           const wchar_t* context) {
     if (!g_logUsage.load(std::memory_order_relaxed)) return;
     if (!emoji || !*emoji || !source) return;
 
-    wchar_t baseDir[MAX_PATH] = {};
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, baseDir)))
-        return;
-
     wchar_t dir[MAX_PATH];
-    swprintf(dir, MAX_PATH, L"%s\\WindhawkMods\\EmojiPicker", baseDir);
-    // CreateDirectory creates only the last component; do parents manually.
-    wchar_t parent[MAX_PATH];
-    swprintf(parent, MAX_PATH, L"%s\\WindhawkMods", baseDir);
-    CreateDirectoryW(parent, nullptr);
-    CreateDirectoryW(dir, nullptr);
+    if (!EmojiDataDir(dir)) return;
 
     wchar_t path[MAX_PATH];
     swprintf(path, MAX_PATH, L"%s\\stats.tsv", dir);
@@ -2290,7 +2389,7 @@ static void BuildShortcodeMap() {
             }
         }
     }
-    Wh_Log(L"Shortcode map: %zu keys for %d emoji", g_shortcodeMap.size(), g_emojiCount);
+    Trace(L"Shortcode map: %zu keys for %d emoji", g_shortcodeMap.size(), g_emojiCount);
 }
 
 // ============================================================
@@ -2349,6 +2448,13 @@ static void UpdateFilter() {
     if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+// Jedes Verstecken läuft hier durch, damit im Trace steht, wer es war —
+// vorher verschwand das Fenster ohne eine einzige Zeile im Log.
+static void HidePicker(HWND hwnd, const wchar_t* grund) {
+    Trace(L"HidePicker: %s (visible=%d)", grund, (int)IsWindowVisible(hwnd));
+    ShowWindow(hwnd, SW_HIDE);
+}
+
 // Forward declaration (SelectEmoji defined later)
 static void SelectEmoji(int filteredIdx);
 static void SelectEmojiCh(std::wstring ch);
@@ -2360,7 +2466,7 @@ static void SelectEmojiCh(std::wstring ch);
 static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
         if (wp == VK_ESCAPE) {
-            ShowWindow(g_hwnd, SW_HIDE);
+            HidePicker(g_hwnd, L"Esc im Suchfeld");
             return 0;
         }
         if (wp == VK_RETURN) {
@@ -2381,7 +2487,9 @@ static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                               : (g_cat + 1) % NUM_CATS;
             } while (g_hideFlags && g_cat == 9);
             g_query[0] = 0;
-            SetWindowTextW(hwnd, L"");  // triggers EN_CHANGE → UpdateFilter
+            SetWindowTextW(hwnd, L"");
+            UpdateFilter();   // nicht auf EN_CHANGE verlassen: war das Feld
+                              // schon leer, bleibt die Benachrichtigung aus
             return 0;
         }
         if (wp == VK_UP || wp == VK_DOWN || wp == VK_LEFT || wp == VK_RIGHT) {
@@ -2505,6 +2613,12 @@ static HRESULT CreateDeviceResources(HWND hwnd) {
         D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(physW, physH)),
         &g_rt);
     if (FAILED(hr)) return hr;
+    // Buchführung hier und nicht erst in ShowPickerAt: das Target entsteht
+    // schon beim Warmup. Blieben die Felder bis zum ersten Win+. leer, sah
+    // ShowPickerAt einen Wechsel, warf das gewärmte Target samt Glyph-Atlas
+    // weg und bezahlte den kalten Render genau dann wieder.
+    g_rtTheme = g_theme;
+    g_rtDpi   = dpi;
     auto& t = *g_theme;
     g_rt->CreateSolidColorBrush(t.text,   &g_brText);
     g_rt->CreateSolidColorBrush(t.hover,  &g_brHover);
@@ -2724,14 +2838,20 @@ static int RecentHit(int mxPhys, int myPhys) {
 // ============================================================
 
 static void DoInsert() {
+    // Alles in einen SendInput: die meisten Emoji sind Surrogatpaare, und in
+    // getrennten Aufrufen kann echter Tastendruck zwischen die beiden Hälften
+    // rutschen — die Zielanwendung sieht dann ein halbes Zeichen.
+    std::vector<INPUT> seq;
+    seq.reserve(g_pending.size() * 2);
     for (wchar_t wc : g_pending) {
-        INPUT ki[2] = {};
-        ki[0].type = ki[1].type = INPUT_KEYBOARD;
-        ki[0].ki.wScan = ki[1].ki.wScan = wc;
-        ki[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        ki[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        SendInput(2, ki, sizeof(INPUT));
+        INPUT d{}, u{};
+        d.type = u.type = INPUT_KEYBOARD;
+        d.ki.wScan = u.ki.wScan = wc;
+        d.ki.dwFlags = KEYEVENTF_UNICODE;
+        u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        seq.push_back(d); seq.push_back(u);
     }
+    if (!seq.empty()) SendInput((UINT)seq.size(), seq.data(), sizeof(INPUT));
     g_pending.clear();
     g_inserting = false;
 }
@@ -2763,7 +2883,7 @@ static void SelectEmoji(int filteredIdx) {
     g_pending = ch;
     g_inserting = true;
 
-    ShowWindow(g_hwnd, SW_HIDE);
+    HidePicker(g_hwnd, L"Emoji gewählt");
 
     if (!RestorePrevFocus()) {
         // Focus handoff failed — abort insert to avoid typing into the picker.
@@ -2785,7 +2905,7 @@ static void SelectEmojiCh(std::wstring ch) {
     LogEmojiUsage(ch.c_str(), L"recent", L"");
     g_pending   = ch;
     g_inserting = true;
-    ShowWindow(g_hwnd, SW_HIDE);
+    HidePicker(g_hwnd, L"Zuletzt-benutzt gewählt");
     if (!RestorePrevFocus()) {
         g_pending.clear();
         g_inserting = false;
@@ -2797,6 +2917,8 @@ static void SelectEmojiCh(std::wstring ch) {
 // ============================================================
 // Show / position picker
 // ============================================================
+
+static void LayoutSearchEdit(UINT dpi);   // Definition bei den Layout-Helfern
 
 // trigger may be null (e.g. refresh-after-settings-change path). When non-null
 // it supplies this invocation's captured foreground window + anchor point,
@@ -2847,6 +2969,7 @@ static void ShowPickerAt(PickerTrigger* trigger) {
     UINT dpi = GetDpiForWindow(g_hwnd);
     if (!dpi) dpi = 96;
     g_dpi = dpi;
+    LayoutSearchEdit(dpi);
     int physW = MulDiv(WIN_W, dpi, 96);
     int physH = MulDiv(WIN_H, dpi, 96);
 
@@ -2896,16 +3019,17 @@ static void ShowPickerAt(PickerTrigger* trigger) {
     // then show it. Showing first meant the cold first paint (D2D device,
     // Segoe UI Emoji glyph cache) ran with the window already on screen, so
     // the first open after a mod load or boot showed a black rectangle.
+    double tA = NowMs();
     SetWindowPos(g_hwnd, nullptr, x, y, physW, physH,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-    if (g_rtTheme != g_theme || g_rtDpi != dpi) {
+    if (g_rt && (g_rtTheme != g_theme || g_rtDpi != dpi))
         DiscardDeviceResources();      // brushes are theme-bound, target is DPI-bound
-        g_rtTheme = g_theme;
-        g_rtDpi   = dpi;
-    }
-    CreateDeviceResources(g_hwnd);
+    HRESULT hrDev = CreateDeviceResources(g_hwnd);
+    double tB = NowMs();
     RenderFrame();
+    double tC = NowMs();
 
+    g_showing = true;
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, physW, physH, SWP_SHOWWINDOW);
 
     // SetForegroundWindow refuses to move focus when our process isn't in the
@@ -2922,10 +3046,42 @@ static void ShowPickerAt(PickerTrigger* trigger) {
     if (fgTid && fgTid != ourTid)
         attached = AttachThreadInput(fgTid, ourTid, TRUE);
     BringWindowToTop(g_hwnd);
-    SetForegroundWindow(g_hwnd);
-    SetFocus(g_searchEdit);
+    BOOL fgOk = SetForegroundWindow(g_hwnd);
+    HWND prevFocused = SetFocus(g_searchEdit);
     if (attached)
         AttachThreadInput(fgTid, ourTid, FALSE);
+    g_showing = false;
+
+    Trace(L"ShowPickerAt: device=%.1f ms (hr=0x%08X) render=%.1f ms show=%.1f ms "
+          L"layouts=%zu attached=%d fgOk=%d prevFocus=%p fgNow=%d focusNow=%d visible=%d",
+          tB - tA, (unsigned)hrDev, tC - tB, NowMs() - tC,
+          g_emojiLayouts.size(), (int)attached, (int)fgOk, (void*)prevFocused,
+          (int)(GetForegroundWindow() == g_hwnd), (int)(GetFocus() == g_searchEdit),
+          (int)IsWindowVisible(g_hwnd));
+}
+
+// Suchfeld und seine Schrift auf die übergebene DPI bringen. Das Kindfenster
+// wird in WM_CREATE mit der DPI des damaligen Monitors gebaut; ShowPickerAt
+// dimensioniert das Popup aber nach dem Monitor, auf dem es aufgeht. Ohne das
+// hier behält das Eingabefeld bei gemischter DPI seine alten Pixelmaße.
+static UINT g_editDpi = 0;
+static void LayoutSearchEdit(UINT dpi) {
+    if (!g_searchEdit || !dpi || dpi == g_editDpi) return;
+    g_editDpi = dpi;
+
+    HFONT oldFont = g_hFont;
+    g_hFont = CreateFontW(MulDiv(-17, dpi, 96), 0,0,0, FW_SEMIBOLD, FALSE,FALSE,FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FF_DONTCARE, L"Segoe UI");
+    SendMessage(g_searchEdit, WM_SETFONT, (WPARAM)g_hFont, FALSE);
+    if (oldFont) DeleteObject(oldFont);   // erst ersetzen, dann freigeben
+
+    SetWindowPos(g_searchEdit, nullptr,
+        MulDiv(6,             dpi, 96),
+        MulDiv(16,            dpi, 96),
+        MulDiv(WIN_W - 12,    dpi, 96),
+        MulDiv(SEARCH_H - 24, dpi, 96),
+        SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // ============================================================
@@ -2947,11 +3103,13 @@ static int PrevCat(int cat) {
 // Window procedure
 // ============================================================
 
+static std::wstring GetForegroundExeName();   // für den Trace unten
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
     case WM_HIDE_PICKER:
-        ShowWindow(hwnd, SW_HIDE);
+        HidePicker(hwnd, L"WM_HIDE_PICKER");
         return 0;
 
     case WM_SYNTH_F23: {
@@ -2964,48 +3122,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_WARMUP: {
-        // Paint one frame into the still-hidden window: loads the D2D device,
-        // Segoe UI Emoji and the glyph cache now instead of during the first
-        // Win+. This thread also dispatches the low-level keyboard hook, so a
-        // cold render there can blow the hook timeout and let the keystroke
-        // through to the system emoji dialog.
-        DWORD t0 = GetTickCount();
-        RenderFrame();
-        Wh_Log(L"Warmup render: %u ms, rt=%p", GetTickCount() - t0, (void*)g_rt);
-        HANDLE h = CreateThread(nullptr, 0, WarmupWorker, nullptr, 0, nullptr);
-        if (h) CloseHandle(h);
-        return 0;
-    }
-
     case WM_LAYOUTS_READY: {
         auto* v = reinterpret_cast<std::vector<IDWriteTextLayout*>*>(lp);
         for (auto& p : g_emojiLayouts) if (p) { p->Release(); p = nullptr; }
         g_emojiLayouts = std::move(*v);
         delete v;
-        RenderFrame();                  // warm the layouts while still hidden
+        {
+            double t0 = NowMs();
+            RenderFrame();              // warm the layouts while still hidden
+            Trace(L"Layouts ready: %zu, render %.1f ms",
+                  g_emojiLayouts.size(), NowMs() - t0);
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
     case WM_CREATE: {
-        g_hFont = CreateFontW(-17, 0,0,0, FW_SEMIBOLD, FALSE,FALSE,FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, FF_DONTCARE, L"Segoe UI");
-
         {
             UINT dpi = GetDpiForWindow(hwnd);
             if (!dpi) dpi = 96;
             g_searchEdit = CreateWindowExW(0, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
-                MulDiv(6,            dpi, 96),
-                MulDiv(16,           dpi, 96),
-                MulDiv(WIN_W - 12,   dpi, 96),
-                MulDiv(SEARCH_H - 24, dpi, 96),
+                0, 0, 0, 0,
                 hwnd, (HMENU)(UINT_PTR)IDC_SEARCH,
                 GetModuleHandle(nullptr), nullptr);
+            LayoutSearchEdit(dpi);   // legt Schrift und Maße an
         }
-        SendMessage(g_searchEdit, WM_SETFONT, (WPARAM)g_hFont, FALSE);
         SendMessage(g_searchEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L"Search emoji...");
         g_editProc = (WNDPROC)SetWindowLongPtrW(g_searchEdit, GWLP_WNDPROC,
             (LONG_PTR)EditSubclassProc);
@@ -3073,8 +3215,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SHOW_PICKER: {
         auto* trig = reinterpret_cast<PickerTrigger*>(lp);
+        double t0 = NowMs();
+        // Der Guard, weil GetForegroundExeName() sonst als Argument auch bei
+        // ausgeschaltetem Trace liefe: OpenProcess + QueryFullProcessImageName
+        // auf genau dem Thread, den der Trace entlasten sollte.
+        if (g_trace.load(std::memory_order_relaxed))
+            Trace(L"--- Auslöser #%d (%s): Hookproc %.1f ms, Warteschlange %.1f ms, "
+                  L"fg=%s visible=%d rt=%p layouts=%zu",
+                  g_trigSeq.load(), g_trigHow.load(), g_hookMs.load(),
+                  t0 - g_trigMs.load(), GetForegroundExeName().c_str(),
+                  (int)IsWindowVisible(hwnd), (void*)g_rt, g_emojiLayouts.size());
         ShowPickerAt(trig);
         delete trig;
+        Trace(L"Auslöser #%d fertig nach %.1f ms", g_trigSeq.load(), NowMs() - t0);
         return 0;
     }
 
@@ -3201,8 +3354,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_ACTIVATE:
-        if (LOWORD(wp) == WA_INACTIVE && !g_inserting)
-            ShowWindow(hwnd, SW_HIDE);
+        Trace(L"WM_ACTIVATE: %s inserting=%d focus=%d",
+              LOWORD(wp) == WA_INACTIVE ? L"inaktiv" : L"aktiv",
+              (int)g_inserting.load(), (int)(GetFocus() == g_searchEdit));
+        if (LOWORD(wp) == WA_INACTIVE && !g_inserting && !g_showing)
+            HidePicker(hwnd, L"Fokus verloren");
         else
             // ShowPickerAt already calls SetFocus, but on the first open the
             // activation triggered by SetForegroundWindow can land after it
@@ -3255,7 +3411,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) ShowWindow(hwnd, SW_HIDE);
+        if (wp == VK_ESCAPE) HidePicker(hwnd, L"Esc im Fenster");
         else if (wp == VK_RETURN && !g_filtered.empty()) {
             int idx = (g_hoverIdx >= 0 && g_hoverIdx < (int)g_filtered.size()) ? g_hoverIdx : 0;
             SelectEmoji(idx);
@@ -3309,8 +3465,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEWHEEL: {
-        int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        g_scrollY -= (delta / WHEEL_DELTA) * CELL * 3;
+        // Präzisions-Touchpads und Freilaufräder liefern Deltas unter 120.
+        // Ohne Rest-Übertrag ergäbe die Ganzzahldivision 0 und das Raster
+        // bewegte sich keinen Pixel.
+        static int wheelRest = 0;
+        wheelRest += GET_WHEEL_DELTA_WPARAM(wp);
+        int notches = wheelRest / WHEEL_DELTA;
+        wheelRest -= notches * WHEEL_DELTA;
+        if (!notches) return 0;
+        g_scrollY -= notches * CELL * 3;
         int rows = ((int)g_filtered.size() + COLS - 1) / COLS;
         int maxY = std::max(0, rows * CELL - GRID_H);
 
@@ -3522,6 +3685,26 @@ static void ScCheckMatch() {
     g_scLen = openAt;
 }
 
+// Setzen der Auslöser-Buchhaltung passiert im Hook-Thread — keine Datei-I/O
+// hier, ein langsamer Hookproc ist genau der Fehler, den wir suchen (Windows
+// wirft Hooks über LowLevelHooksTimeout raus).
+// Win+., der eigene Shortcut und Ctrl+Space machten dieselben vier Schritte.
+static void PostPickerTrigger(const wchar_t* how) {
+    double h0 = NowMs();
+    if (g_hwnd && IsWindowVisible(g_hwnd)) {
+        PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
+        return;
+    }
+    auto* trig = CapturePickerTrigger();
+    AllowSetForegroundWindow(GetCurrentProcessId());
+    g_trigHow = how;
+    g_trigSeq++;
+    g_trigMs = NowMs();
+    if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
+        delete trig;
+    g_hookMs = NowMs() - h0;
+}
+
 static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         auto* k = (KBDLLHOOKSTRUCT*)lp;
@@ -3552,14 +3735,8 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     (shortcut == AltShortcut::CtrlPeriod && g_ctrlDown) ||
                     (shortcut == AltShortcut::AltPeriod  && g_altDown);
                 if (customShortcut) {
-                    if (g_hwnd && IsWindowVisible(g_hwnd))
-                        PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
-                    else {
-                        auto* trig = CapturePickerTrigger();
-                        AllowSetForegroundWindow(GetCurrentProcessId());
-                        if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
-                            delete trig;
-                    }
+                    PostPickerTrigger(shortcut == AltShortcut::AltPeriod
+                        ? L"alt+." : L"ctrl+.");
                     return 1;  // block the key
                 } else if ((g_winDown || ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)) && g_blockWinDot) {
                     // Win+. — open picker and suppress the period so the system
@@ -3567,14 +3744,7 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
                     // GetAsyncKeyState is used as a fallback in case g_winDown
                     // fell out of sync (e.g. key pressed before hook was active
                     // or cleared by an injected Win-up from another app).
-                    if (g_hwnd && IsWindowVisible(g_hwnd))
-                        PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
-                    else {
-                        auto* trig = CapturePickerTrigger();
-                        AllowSetForegroundWindow(GetCurrentProcessId());
-                        if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
-                            delete trig;
-                    }
+                    PostPickerTrigger(L"win+.");
                     // Inject a neutral VK_F23 down+up so Windows sees that Win
                     // was pressed in combination with another key.  Without this,
                     // the system observes Win↓ … Win↑ with no other key in
@@ -3591,14 +3761,7 @@ static LRESULT CALLBACK KbHookProc(int code, WPARAM wp, LPARAM lp) {
             } else if (k->vkCode == VK_SPACE &&
                        g_altShortcut.load(std::memory_order_relaxed) == AltShortcut::CtrlSpace && g_ctrlDown &&
                        ((GetAsyncKeyState(VK_LCONTROL) | GetAsyncKeyState(VK_RCONTROL)) & 0x8000)) {
-                if (g_hwnd && IsWindowVisible(g_hwnd))
-                    PostMessage(g_hwnd, WM_HIDE_PICKER, 0, 0);
-                else {
-                    auto* trig = CapturePickerTrigger();
-                    AllowSetForegroundWindow(GetCurrentProcessId());
-                    if (!g_hwnd || !PostMessage(g_hwnd, WM_SHOW_PICKER, 0, (LPARAM)trig))
-                        delete trig;
-                }
+                PostPickerTrigger(L"ctrl+space");
                 return 1;  // block Ctrl+Space
             }
 
@@ -3734,6 +3897,20 @@ static DWORD WINAPI EmojiThread(LPVOID) {
     // there's no race on first keystroke. ~30k entries, ~30 ms on first run.
     BuildShortcodeMap();
 
+    // Warmup-Render VOR dem Hook. Er lädt D2D-Device, Segoe UI Emoji und den
+    // Glyph-Cache und dauert gemessen 340–550 ms. Solange kein Hook hängt,
+    // verzögert diese halbe Sekunde keinen Tastendruck; hinter dem Hook
+    // installiert überschritt sie auf Rechnern mit dem voreingestellten
+    // LowLevelHooksTimeout von 300 ms genau das Budget.
+    {
+        double tw = NowMs();
+        RenderFrame();
+        Trace(L"Warmup render: %.1f ms, rt=%p", NowMs() - tw, (void*)g_rt);
+    }
+    // Layouts (ein IDWriteTextLayout je Emoji) im Nebenthread — das Ergebnis
+    // kommt als WM_LAYOUTS_READY zurück.
+    g_warmupThread = CreateThread(nullptr, 0, WarmupWorker, nullptr, 0, nullptr);
+
     // Install global keyboard hook
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbHookProc, nullptr, 0);
     if (!g_kbHook) Wh_Log(L"Failed to install keyboard hook");
@@ -3741,11 +3918,7 @@ static DWORD WINAPI EmojiThread(LPVOID) {
     // only once Win+. is actually intercepted.
     if (g_hookReady) SetEvent(g_hookReady);
 
-    Wh_Log(L"Emoji picker ready, %d emoji loaded", g_emojiCount);
-
-    // Warm up glyph cache asynchronously — runs in the message loop so the
-    // keyboard hook (above) is already active and the picker is immediately usable.
-    PostMessage(g_hwnd, WM_WARMUP, 0, 0);
+    Trace(L"EmojiThread bereit: hook=%p, %d Emoji", (void*)g_kbHook, g_emojiCount);
 
     // Message loop
     {
@@ -3759,6 +3932,15 @@ static DWORD WINAPI EmojiThread(LPVOID) {
 cleanup:
     if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
     if (g_hwnd)   { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
+
+    // Erst hier, nicht früher: der Layout-Thread liest g_emojis aus dieser DLL,
+    // und Windhawk entlädt sie, sobald Wh_ModUninit zurückkommt — das wartet
+    // seinerseits auf diesen Thread.
+    if (g_warmupThread) {
+        WaitForSingleObject(g_warmupThread, 5000);
+        CloseHandle(g_warmupThread);
+        g_warmupThread = nullptr;
+    }
 
     for (auto& p : g_emojiLayouts) SafeRelease(&p);
     g_emojiLayouts.clear();
@@ -3814,6 +3996,13 @@ static void ReadSettings() {
     g_hideFlags   = Wh_GetIntSetting(L"hideFlags") != 0;
     g_shortcodesEnabled = Wh_GetIntSetting(L"shortcodes") != 0;
     g_logUsage          = Wh_GetIntSetting(L"logUsage")   != 0;
+    g_trace             = Wh_GetIntSetting(L"trace")      != 0;
+    // Öffnen erst hier, nicht in Wh_ModInit: mit ausgeschaltetem Trace
+    // entsteht gar kein trace.log. Beim Ausschalten zur Laufzeit bleibt die
+    // Datei offen bis Wh_ModUninit — g_trace stoppt die Schreibvorgänge, und
+    // ein Close hier könnte dem Hook-Thread das Handle unter der Hand
+    // wegziehen.
+    if (g_trace) OpenTraceFile();
     int d = Wh_GetIntSetting(L"shortcodeDelayMs");
     if (d < 0) d = 0;
     if (d > 200) d = 200;  // clamp; longer = unusable
@@ -3843,10 +4032,10 @@ static void ReadSettings() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Emoji Picker: init");
     InitializeCriticalSection(&g_shortcodeDenyCs);
     g_shortcodeDenyCsInit = true;
-    ReadSettings();
+    ReadSettings();            // öffnet trace.log, falls der Trace an ist
+    Trace(L"ModInit: Start");
     // Manual-reset event so we can wait across thread startup without timing
     // the worker thread against the hook install.
     g_hookReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -3860,7 +4049,9 @@ BOOL Wh_ModInit() {
     // the mod and have it work — rather than sometimes falling through to the
     // system emoji dialog during the race window.
     if (g_hookReady) {
-        WaitForSingleObject(g_hookReady, 2000);
+        // 5 s statt 2: seit der Warmup-Render vor dem Hook läuft, meldet der
+        // Worker den Hook-Zustand erst nach Fensterbau + Map + Render.
+        WaitForSingleObject(g_hookReady, 5000);
         CloseHandle(g_hookReady);
         g_hookReady = nullptr;
     }
@@ -3878,6 +4069,7 @@ BOOL Wh_ModInit() {
         }
         return FALSE;
     }
+    Trace(L"ModInit: fertig, hook=%p", (void*)g_kbHook);
     return TRUE;
 }
 
@@ -3913,4 +4105,5 @@ void Wh_ModUninit() {
         DeleteCriticalSection(&g_shortcodeDenyCs);
         g_shortcodeDenyCsInit = false;
     }
+    CloseTraceFile();
 }
