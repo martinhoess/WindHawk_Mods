@@ -10,9 +10,13 @@ Fork of [System Tray Folders](https://github.com/ramensoftware/windhawk-mods/blo
 
 - New setting **Folder style**:
   - *Folder tiles* — the original behavior (a tile per folder, click to open).
-  - *Expanded groups* — each folder becomes a header row followed by its icons. The header shows the folder name right-aligned and the folder glyph at the far right, in a dimmed text color with a divider below. Headers can't be clicked or focused.
+  - *Expanded groups* — each folder becomes a header row followed by its icons. The header shows the folder name right-aligned and the folder glyph at the far right, in a dimmed text color with a divider below. Headers can't be clicked.
 - In groups mode a divider row separates the groups from the icons that aren't in any folder (after the last group with *Before other icons*, before the first one with *After other icons*).
 - Header and divider use theme resources (`TextFillColorTertiaryBrush`, `DividerStrokeColorDefaultBrush`), so they follow light and dark mode.
+
+## Installing
+
+Disable or uninstall the original System Tray Folders first. Both hook the same flyout, so running them side by side groups the icons twice.
 
 ## Use together with Tray Overflow List
 

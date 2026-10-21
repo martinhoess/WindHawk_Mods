@@ -551,15 +551,21 @@ static void LoadSettings() {
         Wh_FreeStringSetting(value);
     }
 
+    // Skip a single blank entry (the UI starts with one), stop after two.
     g_excludedMonitors.clear();
-    for (int i = 0;; i++) {
+    for (int i = 0, blanks = 0; i < 100 && blanks < 2; i++) {
         PCWSTR value = Wh_GetStringSetting(L"excludedMonitors[%d]", i);
-        if (!*value) {
-            Wh_FreeStringSetting(value);
-            break;
-        }
-        g_excludedMonitors.push_back(value);
+        std::wstring name = value;
         Wh_FreeStringSetting(value);
+        name.erase(0, name.find_first_not_of(L" \t"));
+        name.erase(name.find_last_not_of(L" \t") + 1);
+        if (name.empty()) {
+            blanks++;
+            continue;
+        }
+        blanks = 0;
+        Wh_Log(L"Excluded monitor: %s", name.c_str());
+        g_excludedMonitors.push_back(std::move(name));
     }
 
     EnumDisplayMonitors(nullptr, nullptr, LogMonitorProc, 0);

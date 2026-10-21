@@ -8,10 +8,14 @@ Fork of [Secondary Monitor Pin](https://github.com/ramensoftware/windhawk-mods/b
 
 ## Changes in this fork
 
-- New setting **Excluded monitors**: monitors listed there are treated like the primary monitor, so windows on them are not pinned (and are unpinned again when the mod had pinned them). Use the device name, e.g. `DISPLAY2`; `\\.\DISPLAY2` works too, case doesn't matter.
+- New setting **Excluded monitors**: monitors listed there are treated like the primary monitor, so windows on them are not pinned (and are unpinned again when the mod had pinned them). Use the device name, e.g. `DISPLAY2`; `\\.\DISPLAY2` works too, case doesn't matter. Blank entries and surrounding spaces are ignored, the mod log lists the loaded names.
 - Every time the settings are loaded, the mod log lists all connected monitors with name, resolution and position (`Monitor DISPLAY2: 3840x2160 at (x,y)`), so the name can be looked up instead of guessed.
 
 `DISPLAYn` is a slot number, not a hardware ID. It can change after replugging monitors or when a virtual display comes and goes.
+
+## Installing
+
+Disable or uninstall the original Secondary Monitor Pin first. Both would pin and unpin the same windows.
 
 ## Settings
 
