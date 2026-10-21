@@ -1,10 +1,11 @@
 // ==WindhawkMod==
 // @id              secondary-monitor-pin
 // @name            Secondary Monitor Pin
-// @description     Keeps windows that are placed on secondary monitors pinned so they appear on all virtual desktops.
-// @version         1.1
+// @description     Keeps windows that are placed on secondary monitors pinned so they appear on all virtual desktops. Fork with a list of excluded monitors
+// @version         1.1-mh.1
 // @author          tafadias
 // @github          https://github.com/tafadias
+// @homepage        https://github.com/martinhoess/WindHawk_Mods/tree/main/mods/secondary-monitor-pin
 // @include         windhawk.exe
 // @license         MIT
 // @compilerOptions -luser32 -lole32 -ldwmapi -luuid
@@ -13,6 +14,20 @@
 // ==WindhawkModReadme==
 /*
 # Secondary Monitor Pin
+
+> **Fork** of [Secondary Monitor Pin](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/secondary-monitor-pin.wh.cpp)
+> 1.1 by tafadias, published under the same license (MIT). Changes in this
+> fork:
+>
+> * New setting **Excluded monitors**: monitors listed there are treated like
+>   the primary monitor, so windows on them are not pinned. Names are the
+>   device names Windows uses, e.g. `DISPLAY2` (`\\.\DISPLAY2` works too,
+>   case doesn't matter).
+> * Every time the settings are loaded, the mod log lists all connected
+>   monitors with name, resolution and position, so the right name can be
+>   looked up instead of guessed.
+> * Note: `DISPLAYn` is a slot number, not a hardware ID. It can change after
+>   replugging monitors or when a virtual display comes and goes.
 
 Automatically pins windows that are placed on a **secondary monitor** so that
 they are shown on **all virtual desktops**, the same as choosing *Show this
@@ -56,6 +71,12 @@ desktops.
   $description: >-
     Window classes that should never be pinned, one per entry. A number of
     system classes are always excluded.
+- excludedMonitors: [""]
+  $name: Excluded monitors
+  $description: >-
+    Monitors that behave like the primary monitor (windows on them are not
+    pinned), one per entry, e.g. DISPLAY2. The mod log lists the names of all
+    connected monitors with resolution and position.
 */
 // ==/WindhawkModSettings==
 
@@ -139,6 +160,12 @@ static std::vector<CachedWindow> g_cache;
 
 static LONG g_pollIntervalMs = 800;
 static std::vector<std::wstring> g_extraExcluded;
+static std::vector<std::wstring> g_excludedMonitors;
+
+// "\\.\DISPLAY2" and "DISPLAY2" both name the same monitor.
+static const wchar_t* StripDevicePrefix(const wchar_t* name) {
+    return wcsncmp(name, L"\\\\.\\", 4) == 0 ? name + 4 : name;
+}
 
 static bool ContainsPinned(HWND hwnd) {
     for (HWND h : g_wePinned) {
@@ -216,12 +243,33 @@ static bool IsOnPrimaryMonitor(HWND hwnd) {
     if (!hMon)
         return true;
 
-    MONITORINFO mi = {};
+    MONITORINFOEXW mi = {};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(hMon, &mi))
         return true;
 
-    return (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    if (mi.dwFlags & MONITORINFOF_PRIMARY)
+        return true;
+
+    // Excluded monitors count as primary, so windows there stay unpinned.
+    const wchar_t* device = StripDevicePrefix(mi.szDevice);
+    for (const std::wstring& name : g_excludedMonitors) {
+        if (_wcsicmp(device, StripDevicePrefix(name.c_str())) == 0)
+            return true;
+    }
+    return false;
+}
+
+static BOOL CALLBACK LogMonitorProc(HMONITOR hMon, HDC, LPRECT, LPARAM) {
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi)) {
+        const RECT& r = mi.rcMonitor;
+        Wh_Log(L"Monitor %s: %dx%d at (%d,%d)%s", StripDevicePrefix(mi.szDevice),
+               r.right - r.left, r.bottom - r.top, r.left, r.top,
+               (mi.dwFlags & MONITORINFOF_PRIMARY) ? L" primary" : L"");
+    }
+    return TRUE;
 }
 
 static bool IsAltTabWindow(HWND hwnd) {
@@ -502,6 +550,19 @@ static void LoadSettings() {
         g_extraExcluded.push_back(value);
         Wh_FreeStringSetting(value);
     }
+
+    g_excludedMonitors.clear();
+    for (int i = 0;; i++) {
+        PCWSTR value = Wh_GetStringSetting(L"excludedMonitors[%d]", i);
+        if (!*value) {
+            Wh_FreeStringSetting(value);
+            break;
+        }
+        g_excludedMonitors.push_back(value);
+        Wh_FreeStringSetting(value);
+    }
+
+    EnumDisplayMonitors(nullptr, nullptr, LogMonitorProc, 0);
 }
 
 static bool InitCom() {

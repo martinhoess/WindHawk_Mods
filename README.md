@@ -79,6 +79,16 @@ See the [mod README](mods/right-click-ring/) for the roadmap (user-configurable 
 
 ---
 
+### [Secondary Monitor Pin (fork)](mods/secondary-monitor-pin/)
+
+> Fork of [Secondary Monitor Pin](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/secondary-monitor-pin.wh.cpp) by tafadias (MIT). Pins windows on secondary monitors to all virtual desktops, plus a list of monitors that are left out.
+
+**Fork changes**
+- Setting *Excluded monitors* (e.g. `DISPLAY2`): windows there are treated like on the primary monitor and stay unpinned
+- Mod log lists all monitors with name, resolution and position
+
+---
+
 ### [System Tray Folders (fork)](mods/system-tray-folders/)
 
 > Fork of [System Tray Folders](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/system-tray-folders.wh.cpp) by Ris Peng (GPL-3.0-only). Groups hidden tray icons into folders, plus an expanded groups style.
