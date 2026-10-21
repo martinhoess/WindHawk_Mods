@@ -79,6 +79,17 @@ See the [mod README](mods/right-click-ring/) for the roadmap (user-configurable 
 
 ---
 
+### [System Tray Folders (fork)](mods/system-tray-folders/)
+
+> Fork of [System Tray Folders](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/system-tray-folders.wh.cpp) by Ris Peng (GPL-3.0-only). Groups hidden tray icons into folders, plus an expanded groups style.
+
+**Fork changes**
+- Setting *Folder style* → *Expanded groups*: each folder's icons appear directly under a header row (name right-aligned, glyph far right, dimmed, divider below)
+- Divider row between the groups and icons without a folder
+- Meant for use with [Tray Overflow List](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/tray-overflow-list.wh.cpp)
+
+---
+
 ## License
 
-[WTFPL](LICENSE) — Do What The Fuck You Want To Public License
+[WTFPL](LICENSE) — Do What The Fuck You Want To Public License, for the mods written here. The forks keep their original license (MIT or GPL-3.0-only, see the `@license` line of each mod).

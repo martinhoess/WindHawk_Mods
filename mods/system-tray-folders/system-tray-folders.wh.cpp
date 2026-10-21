@@ -1,10 +1,11 @@
 // ==WindhawkMod==
 // @id              system-tray-folders
 // @name            System Tray Folders
-// @description     Group icons in the Windows 11 "Show hidden icons" tray flyout into folders
-// @version         1.0.0
+// @description     Group icons in the Windows 11 "Show hidden icons" tray flyout into folders. Fork with an expanded groups style for Tray Overflow List
+// @version         1.0.0-mh.1
 // @author          Ris Peng
 // @github          https://github.com/RisPNG
+// @homepage        https://github.com/martinhoess/WindHawk_Mods/tree/main/mods/system-tray-folders
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -lversion
@@ -20,6 +21,22 @@
 // ==WindhawkModReadme==
 /*
 # System Tray Folders
+
+> **Fork** of [System Tray Folders](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/system-tray-folders.wh.cpp)
+> 1.0.0 by Ris Peng, published unchanged otherwise under the same license
+> (GPL-3.0-only). Changes in this fork:
+>
+> * New setting **Folder style**. *Folder tiles* is the original behavior.
+>   *Expanded groups* shows each folder's icons directly in the flyout, under
+>   a non-clickable header row with the folder name (right-aligned) and its
+>   glyph (far right), in a dimmed color with a divider below. No click into a
+>   folder is needed.
+> * In groups mode a divider row separates the groups from the icons that
+>   aren't in any folder.
+> * Meant to be used together with
+>   [Tray Overflow List](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/tray-overflow-list.wh.cpp),
+>   which turns the flyout into a one-column list. In the plain icon grid a
+>   header only gets one cell and is cut off.
 
 Adds folders to the Windows 11 tray overflow flyout (the "^" / "Show hidden
 icons" popup). Each folder appears as a tile in the icon grid with a preview of
@@ -104,6 +121,15 @@ haven't been tested.
   - end: After other icons
 - showEmptyFolders: false
   $name: Show empty folders
+- folderStyle: tiles
+  $name: Folder style
+  $description: >-
+    Groups show each folder's icons directly under a header with the folder
+    name, no click needed. Meant for the Tray Overflow List mod, in the plain
+    grid a header only gets one cell.
+  $options:
+  - tiles: Folder tiles
+  - groups: Expanded groups
 */
 // ==/WindhawkModSettings==
 
@@ -173,6 +199,7 @@ struct Settings {
     std::vector<FolderConfig> folders;
     bool foldersAtEnd = false;
     bool showEmptyFolders = false;
+    bool groups = false;
 };
 
 Settings g_settings;
@@ -280,6 +307,9 @@ Settings LoadSettings() {
         WindhawkUtils::StringSetting::make(L"folderPosition");
     settings.foldersAtEnd = wcscmp(position.get(), L"end") == 0;
     settings.showEmptyFolders = Wh_GetIntSetting(L"showEmptyFolders");
+    settings.groups = wcscmp(WindhawkUtils::StringSetting::make(L"folderStyle")
+                                 .get(),
+                             L"groups") == 0;
 
     if (!settings.showEmptyFolders &&
         std::all_of(settings.folders.begin(), settings.folders.end(),
@@ -552,6 +582,8 @@ struct OverflowState : std::enable_shared_from_this<OverflowState> {
     Data::Binding originalItemsSourceBinding{nullptr};
 
     std::vector<Tile> folderTiles;
+    std::vector<Controls::Grid> groupHeaders;
+    Controls::Grid groupSeparator{nullptr};
     Tile backTile;
     double tileWidth = 0;
     double tileHeight = 0;
@@ -735,6 +767,42 @@ UIElement CreateFolderPreview(double itemSize) {
     return Markup::XamlReader::Load(xaml).as<UIElement>();
 }
 
+// Non-interactive rows used by the groups style. A header shows the name
+// right-aligned and the glyph at the far right, dimmed, with a divider below.
+// Children: 0 = glyph, 1 = name, 2 = divider. The divider sits 3px above the
+// row's bottom edge to leave a gap before the first icon, and the text sits
+// low in the row so there's some space above it. A separator is a divider-only
+// row between the groups and the icons that aren't in any folder.
+Controls::Grid CreateGroupRow(bool header) {
+    std::wstring xaml = LR"(
+<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      IsHitTestVisible="False" Background="Transparent">
+  <Grid.ColumnDefinitions>
+    <ColumnDefinition Width="*"/>
+    <ColumnDefinition Width="Auto"/>
+  </Grid.ColumnDefinitions>)";
+    if (header) {
+        xaml += LR"(
+  <TextBlock Grid.Column="1" Width="40" Margin="0,0,4,8"
+             VerticalAlignment="Bottom" TextAlignment="Center" FontSize="14"
+             FontFamily="Segoe Fluent Icons, Segoe UI Emoji"
+             Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>
+  <TextBlock Margin="12,0,0,7" VerticalAlignment="Bottom" FontSize="14"
+             TextAlignment="Right"
+             FontWeight="SemiBold" TextWrapping="NoWrap"
+             TextTrimming="CharacterEllipsis"
+             Foreground="{ThemeResource TextFillColorTertiaryBrush}"/>)";
+    }
+    xaml += LR"(
+  <Border Grid.ColumnSpan="2" Height="1" )";
+    xaml += header ? L"Margin=\"12,0,12,3\" VerticalAlignment=\"Bottom\""
+                   : L"Margin=\"12,0,12,0\" VerticalAlignment=\"Center\"";
+    xaml += LR"(
+          Background="{ThemeResource DividerStrokeColorDefaultBrush}"/>
+</Grid>)";
+    return Markup::XamlReader::Load(xaml).as<Controls::Grid>();
+}
+
 void OpenFolder(OverflowState& state, int folder);
 void CloseFolder(OverflowState& state);
 
@@ -750,6 +818,8 @@ void ClearTiles(OverflowState& state) {
         ClearTile(tile);
     }
     state.folderTiles.clear();
+    state.groupHeaders.clear();
+    state.groupSeparator = nullptr;
     ClearTile(state.backTile);
 }
 
@@ -915,6 +985,7 @@ void Rebuild(OverflowState& state, bool opening) {
             state.tileWidth != tileWidth || state.tileHeight != tileHeight) {
             ClearTiles(state);
             state.folderTiles.resize(folders.size());
+            state.groupHeaders.resize(folders.size(), nullptr);
             state.tileWidth = tileWidth;
             state.tileHeight = tileHeight;
         }
@@ -985,6 +1056,51 @@ void Rebuild(OverflowState& state, bool opening) {
                 if (icon->folder == state.openFolder) {
                     items.push_back(icon->viewModel);
                 }
+            }
+        } else if (g_settings.groups) {
+            // Blocks in display order: each non-empty group (header + icons)
+            // and the icons without a folder, joined by separator rows.
+            std::vector<std::vector<wf::IInspectable>> blocks;
+            for (size_t k = 0; k < folders.size(); k++) {
+                if (folderCounts[k] == 0 && !g_settings.showEmptyFolders) {
+                    continue;
+                }
+                auto& header = state.groupHeaders[k];
+                if (!header) {
+                    header = CreateGroupRow(true);
+                }
+                auto parts = header.Children();
+                parts.GetAt(0).as<Controls::TextBlock>().Text(
+                    folders[k].glyph.empty() ? L"\uE8B7" : folders[k].glyph);
+                parts.GetAt(1).as<Controls::TextBlock>().Text(folders[k].name);
+                auto& block = blocks.emplace_back();
+                block.push_back(header);
+                for (const auto& icon : icons) {
+                    if (icon->folder == (int)k) {
+                        block.push_back(icon->viewModel);
+                    }
+                }
+            }
+            std::vector<wf::IInspectable> looseItems;
+            for (const auto& icon : icons) {
+                if (icon->folder < 0) {
+                    looseItems.push_back(icon->viewModel);
+                }
+            }
+            size_t looseIndex = SIZE_MAX;
+            if (!looseItems.empty()) {
+                looseIndex = g_settings.foldersAtEnd ? 0 : blocks.size();
+                blocks.insert(blocks.begin() + looseIndex,
+                              std::move(looseItems));
+            }
+            for (size_t b = 0; b < blocks.size(); b++) {
+                if (b > 0 && (b == looseIndex || b - 1 == looseIndex)) {
+                    if (!state.groupSeparator) {
+                        state.groupSeparator = CreateGroupRow(false);
+                    }
+                    items.push_back(state.groupSeparator);
+                }
+                items.insert(items.end(), blocks[b].begin(), blocks[b].end());
             }
         } else {
             std::vector<wf::IInspectable> folderItems;
